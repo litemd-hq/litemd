@@ -31,3 +31,28 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Built binary and goreleaser output
+/litemd
+/dist/
+
+# Local planning notes
+PLAN.md
+
+# Local-only notes for client authors (see CLIENT_GUIDE.md header)
+CLIENT_GUIDE.md
+
+# macOS
+.DS_Store
+._*
+
+# Local runtime state. The default data directory (-data ./data) and the
+# wizard's default output (litemd init -> ./config.json) both land in the repo
+# root if you run the server from here. NEVER commit the data directory: it
+# holds the JWT secret, password hashes and your whole vault.
+/data/
+/config.json
+
+# Tool scratch directories (Crush keeps a multi-megabyte database here; it also
+# ships its own .gitignore, but do not depend on that)
+/.crush/

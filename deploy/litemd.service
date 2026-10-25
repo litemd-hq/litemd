@@ -1,0 +1,28 @@
+[Unit]
+Description=litemd file sync server
+Documentation=https://github.com/litemd-hq/litemd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=litemd
+Group=litemd
+# StateDirectory creates /var/lib/litemd owned by the service user.
+StateDirectory=litemd
+ExecStart=/usr/local/bin/litemd -addr 127.0.0.1:8443 -data /var/lib/litemd
+# To configure via file instead, put the JSON there and use:
+# ExecStart=/usr/local/bin/litemd -config /etc/litemd/config.json
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the service only needs its state directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/litemd
+
+[Install]
+WantedBy=multi-user.target

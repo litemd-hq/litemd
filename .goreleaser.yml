@@ -1,0 +1,82 @@
+# GoReleaser configuration for litemd.
+# Builds static binaries for linux/macOS/Windows and publishes archives with
+# checksums. Run locally with: goreleaser release --snapshot --clean
+version: 2
+
+project_name: litemd
+
+builds:
+  - id: litemd
+    main: ./cmd/litemd
+    binary: litemd
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    # GOARM only applies to arm; v6 covers Pi Zero/1 and v7 the 32-bit Pi 2/3/4/5.
+    goarm:
+      - "6"
+      - "7"
+    ignore:
+      - goos: windows
+        goarch: arm64
+      - goos: windows
+        goarch: arm
+      - goos: darwin
+        goarch: arm
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  # Tarballs/zip: these preserve the executable bit and file mode.
+  - id: litemd
+    ids: [litemd]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "arm64" }}aarch64
+      {{- else if eq .Arch "arm" }}armv{{ .Arm }}
+      {{- else }}{{ .Arch }}{{ end }}
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+  # Bare executables, so a release also ships something you can download and
+  # run directly instead of unpacking an archive. goreleaser appends ".exe"
+  # itself on Windows, so the template must not add it. Caveat: GitHub does not
+  # store the executable bit, so a downloaded binary may need `chmod +x`.
+  - id: litemd-binaries
+    ids: [litemd]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "arm64" }}aarch64
+      {{- else if eq .Arch "arm" }}armv{{ .Arm }}
+      {{- else }}{{ .Arch }}{{ end }}
+    formats: [binary]
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  draft: false

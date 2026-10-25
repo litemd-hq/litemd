@@ -1,0 +1,707 @@
+openapi: 3.0.3
+info:
+  title: litemd File Sync API
+  version: 1.0.0
+  description: |
+    A lightweight, single-binary Markdown sync server. Files are stored
+    per-user and synced with optimistic concurrency (ETag / If-Match).
+    Markdown files additionally expose structured frontmatter metadata.
+servers:
+  - url: https://localhost:8443
+    description: Default HTTPS listener
+  - url: http://localhost:8443
+    description: Plain HTTP (development, -insecure only)
+tags:
+  - name: Authentication
+  - name: Files
+  - name: Index
+    description: Derived tag, wikilink and graph indexes.
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: Server is up
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+
+  /api/v1/auth/register:
+    post:
+      summary: Register a user
+      description: >
+        The first user of a fresh database becomes admin and may register
+        without a token. Afterwards an admin bearer token is required.
+      tags: [Authentication]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Username already taken
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/auth/login:
+    post:
+      summary: Exchange credentials for tokens
+      tags: [Authentication]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '200':
+          description: Token pair
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/refresh:
+    post:
+      summary: Rotate a refresh token
+      description: >
+        The presented refresh token is consumed and a new pair is issued from
+        the same family. Re-presenting a consumed token revokes the family.
+      tags: [Authentication]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/logout:
+    post:
+      summary: Invalidate a refresh token
+      tags: [Authentication]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '204':
+          description: Token invalidated
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/v1/auth/revoke-all:
+    post:
+      summary: Sign out of every device
+      description: >
+        Deletes every refresh token for the authenticated user. Access tokens
+        already issued remain valid until they expire, so the access-token TTL
+        bounds the revocation window.
+      tags: [Authentication]
+      responses:
+        '200':
+          description: How many refresh tokens were revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/files:
+    get:
+      summary: List the user's file manifest
+      description: >
+        Returns every entry owned by the user, including tombstones
+        (deleted: true) so clients can sync deletions. Markdown entries
+        include parsed frontmatter metadata when present.
+      tags: [Files]
+      responses:
+        '200':
+          description: Manifest
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [files]
+                properties:
+                  files:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Entry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/files/{path}:
+    parameters:
+      - name: path
+        in: path
+        required: true
+        description: Slash-separated path relative to the user's root.
+        schema:
+          type: string
+    get:
+      summary: Download a file
+      tags: [Files]
+      responses:
+        '200':
+          description: >
+            File contents. Content-Type reflects the stored MIME type (see
+            Entry.content_type). Range requests are honored, so media seeking
+            works. Browser-executable types are downgraded to
+            application/octet-stream.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '304':
+          description: Not modified (If-None-Match matched)
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      summary: Upload a file (atomic, optimistic concurrency)
+      description: >
+        The body is written atomically. Every upload must carry exactly one
+        precondition header, so concurrent edits surface as conflicts rather
+        than overwriting each other:
+
+        `If-Match: <version>` is a compare-and-swap update (the file must exist
+        live at that version); `If-None-Match: *` creates a new file and fails
+        if a live file already exists. Markdown paths must be valid UTF-8 and
+        have their frontmatter parsed into metadata.
+      tags: [Files]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Existing file replaced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entry'
+        '201':
+          description: New file created (or revived after a delete)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: >
+            Version mismatch, or the path was deleted. The body carries the
+            current server entry under `error.server_entry` so the client can
+            three-way merge and retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '412':
+          description: >
+            Precondition failed: If-Match on an absent path, If-None-Match on an
+            existing file, a malformed/unsupported precondition, or both
+            preconditions supplied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Payload exceeds upload limit or remaining quota
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+    delete:
+      summary: Delete a file (tombstone, optimistic concurrency)
+      description: >
+        Removes the bytes and records a tombstone so other clients observe the
+        deletion. Requires `If-Match: <version>`; a stale delete cannot clobber
+        a newer write.
+      tags: [Files]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '204':
+          description: Deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Version mismatch; body carries the current entry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '412':
+          description: If-Match is malformed or unsupported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /api/v1/tags:
+    get:
+      summary: List tags with live-note counts
+      tags: [Index]
+      responses:
+        '200':
+          description: Tags, ordered by descending count then name
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tags]
+                properties:
+                  tags:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TagCount'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/tags/{tag}:
+    get:
+      summary: List notes carrying a tag
+      tags: [Index]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          description: Tag name (case-insensitive). Slashes are not addressable here.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Matching live entries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [files]
+                properties:
+                  files:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Entry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/links/{path}:
+    get:
+      summary: Outgoing wikilinks of a note
+      tags: [Index]
+      parameters:
+        - $ref: '#/components/parameters/Path'
+      responses:
+        '200':
+          description: Outgoing links, each annotated with resolution
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, links]
+                properties:
+                  path:
+                    type: string
+                  links:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Link'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/backlinks/{path}:
+    get:
+      summary: Notes that link to a note
+      tags: [Index]
+      parameters:
+        - $ref: '#/components/parameters/Path'
+      responses:
+        '200':
+          description: Incoming links (self-links excluded)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, backlinks]
+                properties:
+                  path:
+                    type: string
+                  backlinks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Backlink'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/unresolved:
+    get:
+      summary: Link targets that do not exist yet
+      description: >
+        Notes referenced by wikilinks but with no matching file, ranked by
+        reference count. Useful for surfacing notes worth creating.
+      tags: [Index]
+      responses:
+        '200':
+          description: Unresolved targets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [unresolved]
+                properties:
+                  unresolved:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, refs]
+                      properties:
+                        name:
+                          type: string
+                        refs:
+                          type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/graph:
+    get:
+      summary: Note graph of nodes and resolved edges
+      tags: [Index]
+      responses:
+        '200':
+          description: Graph
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [nodes, edges]
+                properties:
+                  nodes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/GraphNode'
+                  edges:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/GraphEdge'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Path:
+      name: path
+      in: path
+      required: true
+      description: Slash-separated path relative to the user's root.
+      schema:
+        type: string
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: >
+        Compare-and-swap precondition. For updates and deletes this must be the
+        decimal `version` of the entry the client last saw (not the ETag, which
+        is the content sha256). Use `If-None-Match: *` instead to create.
+      schema:
+        type: string
+        example: "42"
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: >
+        Create-only precondition. Send `*` on upload to assert the path holds no
+        live file; the request fails with 412 if it does. On `GET` this header
+        keeps its usual conditional-request meaning (304).
+      schema:
+        type: string
+        enum: ["*"]
+
+  schemas:
+    Credentials:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 32
+          pattern: '^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$'
+        password:
+          type: string
+          minLength: 8
+          maxLength: 1024
+
+    User:
+      type: object
+      required: [uuid, username, is_admin, quota_bytes]
+      properties:
+        uuid:
+          type: string
+        username:
+          type: string
+        is_admin:
+          type: boolean
+        quota_bytes:
+          type: integer
+          format: int64
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          example: Bearer
+        expires_in:
+          type: integer
+          format: int64
+          description: Access token lifetime in seconds.
+
+    Entry:
+      type: object
+      required: [path, version, sha256, size, mtime]
+      properties:
+        path:
+          type: string
+        version:
+          type: integer
+          format: int64
+          description: Monotonic version used for sync ordering.
+        sha256:
+          type: string
+          description: Hex-encoded content hash; also the ETag.
+        size:
+          type: integer
+          format: int64
+        mtime:
+          type: string
+          format: date-time
+        deleted:
+          type: boolean
+          description: True for tombstones.
+        content_type:
+          type: string
+          description: >
+            MIME type served on download, derived from the path extension or by
+            sniffing the leading bytes. Markdown reports text/markdown. Browser-
+            executable types (HTML, SVG, XML) are downgraded to
+            application/octet-stream. Absent on entries written before this
+            field existed; the server derives it on demand.
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        links:
+          type: array
+          description: Outgoing wikilink targets, as written minus aliases/anchors.
+          items:
+            type: string
+
+    Metadata:
+      type: object
+      description: >
+        Structured YAML frontmatter parsed from a Markdown file. Present only
+        for Markdown uploads; omitted for other files and older entries.
+      properties:
+        title:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        extra:
+          type: object
+          additionalProperties:
+            type: string
+
+    TagCount:
+      type: object
+      required: [tag, count]
+      properties:
+        tag:
+          type: string
+        count:
+          type: integer
+
+    Link:
+      type: object
+      required: [target, exists]
+      properties:
+        target:
+          type: string
+          description: Target as written in the note (alias/anchor stripped).
+        resolved:
+          type: string
+          description: Path of the matching note, when one exists.
+        exists:
+          type: boolean
+
+    Backlink:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+        title:
+          type: string
+          description: Source note's frontmatter title, when present.
+
+    GraphNode:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+        title:
+          type: string
+
+    GraphEdge:
+      type: object
+      required: [from, to]
+      properties:
+        from:
+          type: string
+        to:
+          type: string
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            server_entry:
+              $ref: '#/components/schemas/Entry'
+
+  responses:
+    BadRequest:
+      description: Malformed request or invalid path
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: File not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: Too many requests
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PreconditionRequired:
+      description: >
+        A mutating request was sent without a precondition. Supply
+        `If-Match: <version>` to update/delete or `If-None-Match: *` to create.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+security:
+  - BearerAuth: []

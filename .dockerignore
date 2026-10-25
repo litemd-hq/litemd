@@ -1,0 +1,10 @@
+.git
+.github
+.gitignore
+litemd
+dist
+data
+PLAN.md
+.crush
+*.md
+!README.md
