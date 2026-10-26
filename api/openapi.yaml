@@ -14,6 +14,8 @@ servers:
 tags:
   - name: Authentication
   - name: Files
+  - name: Folders
+    description: First-class folder records so empty folders sync and renames are atomic.
   - name: Index
     description: Derived tag, wikilink and graph indexes.
 
@@ -312,6 +314,188 @@ paths:
         '428':
           $ref: '#/components/responses/PreconditionRequired'
 
+  /api/v1/folders:
+    get:
+      summary: List the user's folder manifest
+      description: >
+        Returns every folder record owned by the user, including tombstones
+        (deleted: true). Folders are first-class: an empty folder syncs between
+        devices because it has its own record and version.
+      tags: [Folders]
+      responses:
+        '200':
+          description: Folder manifest
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [folders]
+                properties:
+                  folders:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Folder'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/folders/{path}:
+    parameters:
+      - name: path
+        in: path
+        required: true
+        description: Slash-separated folder path relative to the user's root.
+        schema:
+          type: string
+    put:
+      summary: Create (or revive) a folder
+      description: >
+        Creates a folder record so that an empty folder syncs between devices.
+        Requires `If-None-Match: *` to assert no live folder exists at the path;
+        parent folders are created automatically. A file and a folder cannot
+        share a path, so this fails if a live file occupies it.
+      tags: [Folders]
+      parameters:
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '201':
+          description: Folder created (or revived after a delete)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Folder'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '412':
+          description: >
+            Precondition failed: a live folder already exists, a file occupies
+            the path (code path_kind_conflict), or the precondition is malformed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+    delete:
+      summary: Delete a folder (tombstone)
+      description: >
+        Tombstones the folder record. By default only that record is removed, so
+        a folder that still holds notes stays in the tree until those are removed
+        too. With `?recursive=true` the entire subtree — every descendant folder
+        and file — is tombstoned and its bytes removed in one transaction.
+        Requires `If-Match: <version>`.
+      tags: [Folders]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - name: recursive
+          in: query
+          required: false
+          description: When `true`, delete the folder and everything inside it.
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: "Recursive delete: the affected records (all tombstones)"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [folders, files]
+                properties:
+                  folders:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Folder'
+                  files:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Entry'
+        '204':
+          description: Deleted (non-recursive)
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Version mismatch; body carries the current folder
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '412':
+          description: If-Match is malformed or unsupported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+    post:
+      summary: Rename or move a folder (atomic)
+      description: >
+        Moves the folder and everything beneath it in a single transaction,
+        rewriting every affected path. The response carries a tombstone for each
+        old path and a live record for each new path, so other devices observe
+        the change as a delete plus a create. The real directory is renamed on
+        disk too, so downloads keep working. Requires `If-Match: <version>` of
+        the source folder.
+      tags: [Folders]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              properties:
+                to:
+                  type: string
+                  description: Destination folder path.
+      responses:
+        '200':
+          description: Affected records (old-path tombstones, new-path entries)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [folders, files]
+                properties:
+                  folders:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Folder'
+                  files:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Entry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: A destination path already holds a live file or folder
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '412':
+          description: >
+            Precondition failed, or the destination is the folder itself or a
+            descendant of it (code invalid_move).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
   /api/v1/tags:
     get:
       summary: List tags with live-note counts
@@ -587,6 +771,27 @@ components:
           items:
             type: string
 
+    Folder:
+      type: object
+      description: >
+        A first-class directory record. Folders carry no bytes; the record is
+        what lets an empty folder sync between devices and what makes a rename a
+        single atomic operation.
+      required: [path, version, mtime]
+      properties:
+        path:
+          type: string
+        version:
+          type: integer
+          format: int64
+          description: Monotonic version used for sync ordering and OCC.
+        mtime:
+          type: string
+          format: date-time
+        deleted:
+          type: boolean
+          description: True for tombstones.
+
     Metadata:
       type: object
       description: >
@@ -667,7 +872,12 @@ components:
             message:
               type: string
             server_entry:
-              $ref: '#/components/schemas/Entry'
+              description: >
+                The current server record for a conflict or failed precondition:
+                an Entry for file mutations, a Folder for folder mutations.
+              oneOf:
+                - $ref: '#/components/schemas/Entry'
+                - $ref: '#/components/schemas/Folder'
 
   responses:
     BadRequest:

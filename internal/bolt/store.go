@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -28,6 +29,7 @@ var (
 	BucketFiles     = []byte("files")     // userUUID\x00path -> files.Entry (JSON)
 	BucketTags      = []byte("tags")      // userUUID\x00tag\x00path -> {1}
 	BucketBacklinks = []byte("backlinks") // userUUID\x00targetKey\x00sourcePath -> {1}
+	BucketFolders   = []byte("folders")   // userUUID\x00path -> files.Folder (JSON)
 	BucketMeta      = []byte("meta")      // versions, jwt_secret
 
 	fileKeySep = []byte{0}
@@ -37,6 +39,9 @@ var (
 	ErrNotFound      = errors.New("not found")
 	ErrConflict      = errors.New("conflict")
 	ErrQuotaExceeded = errors.New("storage quota exceeded")
+	// ErrMoveCollision reports that a folder move would overwrite a live file
+	// or folder at one of the destination paths.
+	ErrMoveCollision = errors.New("destination path already exists")
 )
 
 type Store struct {
@@ -52,7 +57,7 @@ func Open(dataDir string) (*Store, error) {
 		return nil, err
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{BucketUsers, BucketNames, BucketRefresh, BucketFiles, BucketTags, BucketBacklinks, BucketMeta} {
+		for _, b := range [][]byte{BucketUsers, BucketNames, BucketRefresh, BucketFiles, BucketTags, BucketBacklinks, BucketFolders, BucketMeta} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -272,6 +277,12 @@ func (s *Store) putEntry(tx *bolt.Tx, userUUID string, e *files.Entry, quota int
 		if used+e.Size > quota {
 			return ErrQuotaExceeded
 		}
+	}
+
+	// Keep the folder tree backed by records: every ancestor of a written file
+	// becomes an explicit folder record so folders sync even when empty.
+	if err := ensureFoldersTx(tx, userUUID, e.Path); err != nil {
+		return err
 	}
 
 	// Drop index entries for whatever this path looked like before.
@@ -642,6 +653,446 @@ func (s *Store) UsedBytes(userUUID string) (int64, error) {
 
 func bytesHasPrefix(b, prefix []byte) bool {
 	return len(b) >= len(prefix) && string(b[:len(prefix)]) == string(prefix)
+}
+
+// --- folders ---
+
+func folderKey(userUUID, cleanPath string) []byte {
+	return append(append([]byte(userUUID), fileKeySep...), []byte(cleanPath)...)
+}
+
+// ensureFoldersTx creates (or revives) an explicit folder record for every
+// ancestor directory of path, so that every folder in the tree is backed by a
+// record and therefore syncs, carries a version, and can be moved.
+func ensureFoldersTx(tx *bolt.Tx, userUUID, path string) error {
+	dirs := files.AncestorDirs(path)
+	if len(dirs) == 0 {
+		return nil
+	}
+	b := tx.Bucket(BucketFolders)
+	now := time.Now().UTC()
+	for _, dir := range dirs {
+		key := folderKey(userUUID, dir)
+		if raw := b.Get(key); raw != nil {
+			var f files.Folder
+			if err := json.Unmarshal(raw, &f); err != nil {
+				return err
+			}
+			if !f.Deleted {
+				continue
+			}
+			v, err := nextVersionTx(tx)
+			if err != nil {
+				return err
+			}
+			f.Deleted = false
+			f.Version = v
+			f.ModTime = now
+			enc, err := json.Marshal(&f)
+			if err != nil {
+				return err
+			}
+			if err := b.Put(key, enc); err != nil {
+				return err
+			}
+			continue
+		}
+		v, err := nextVersionTx(tx)
+		if err != nil {
+			return err
+		}
+		f := files.Folder{Path: dir, Version: v, ModTime: now}
+		enc, err := json.Marshal(&f)
+		if err != nil {
+			return err
+		}
+		if err := b.Put(key, enc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PutFolder stores a folder record, assigning a fresh version and ensuring its
+// ancestor folders exist.
+func (s *Store) PutFolder(userUUID string, f *files.Folder) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		if err := ensureFoldersTx(tx, userUUID, f.Path); err != nil {
+			return err
+		}
+		v, err := nextVersionTx(tx)
+		if err != nil {
+			return err
+		}
+		f.Version = v
+		enc, err := json.Marshal(f)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(BucketFolders).Put(folderKey(userUUID, f.Path), enc)
+	})
+}
+
+// EnsureFolderPath creates the ancestor folder records for path if missing. It
+// is used by the one-time backfill for databases written before folders existed.
+func (s *Store) EnsureFolderPath(userUUID, path string) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		return ensureFoldersTx(tx, userUUID, path)
+	})
+}
+
+// BackfillFolders creates folder records for the ancestors of every live file.
+// It upgrades databases written before folders existed; it is a no-op for an
+// already-migrated vault.
+func (s *Store) BackfillFolders() error {
+	all, err := s.AllFiles()
+	if err != nil {
+		return err
+	}
+	for _, uf := range all {
+		if uf.Entry.Deleted {
+			continue
+		}
+		if err := s.EnsureFolderPath(uf.UserUUID, uf.Entry.Path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GetFolder returns the folder record at cleanPath, tombstones included.
+func (s *Store) GetFolder(userUUID, cleanPath string) (*files.Folder, error) {
+	var f *files.Folder
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(BucketFolders).Get(folderKey(userUUID, cleanPath))
+		if raw == nil {
+			return ErrNotFound
+		}
+		f = &files.Folder{}
+		return json.Unmarshal(raw, f)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// Folders returns every folder record for a user, including tombstones.
+func (s *Store) Folders(userUUID string) ([]files.Folder, error) {
+	var out []files.Folder
+	prefix := append([]byte(userUUID), fileKeySep...)
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(BucketFolders).Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, v = c.Next() {
+			var f files.Folder
+			if err := json.Unmarshal(v, &f); err != nil {
+				return err
+			}
+			out = append(out, f)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// moveTarget rewrites a path living at or under from so it lives at or under to.
+func moveTarget(path, from, to string) string {
+	if path == from {
+		return to
+	}
+	return to + strings.TrimPrefix(path, from)
+}
+
+func liveFileAt(tx *bolt.Tx, userUUID, cleanPath string) bool {
+	raw := tx.Bucket(BucketFiles).Get(fileKey(userUUID, cleanPath))
+	if raw == nil {
+		return false
+	}
+	var e files.Entry
+	if err := json.Unmarshal(raw, &e); err != nil {
+		return false
+	}
+	return !e.Deleted
+}
+
+func liveFolderAt(tx *bolt.Tx, userUUID, cleanPath string) bool {
+	raw := tx.Bucket(BucketFolders).Get(folderKey(userUUID, cleanPath))
+	if raw == nil {
+		return false
+	}
+	var f files.Folder
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return false
+	}
+	return !f.Deleted
+}
+
+// MoveFolder atomically moves the folder at from, together with every descendant
+// folder record and every file beneath it, to to. It returns the affected
+// entries: a tombstone at each old path and a live record at each new path, so
+// other devices observe the change as a delete plus a create.
+//
+// When userRoot is non-empty the real directory on disk is renamed first, so a
+// missing or unwritable destination aborts the move before the index changes.
+// The caller is responsible for validating from/to and the source precondition.
+func (s *Store) MoveFolder(userRoot, userUUID, from, to string) ([]files.Entry, []files.Folder, error) {
+	var movedFiles []files.Entry
+	var movedFolders []files.Folder
+	err := s.DB.Update(func(tx *bolt.Tx) error {
+		movedFiles, movedFolders = nil, nil
+		filesB := tx.Bucket(BucketFiles)
+		foldersB := tx.Bucket(BucketFolders)
+		prefix := append([]byte(userUUID), fileKeySep...)
+
+		// Collect affected live records first: bbolt forbids mutating a bucket
+		// while iterating it.
+		var srcFiles []files.Entry
+		c := filesB.Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, v = c.Next() {
+			var e files.Entry
+			if err := json.Unmarshal(v, &e); err != nil {
+				return err
+			}
+			if e.Deleted || !files.IsUnder(e.Path, from) {
+				continue
+			}
+			srcFiles = append(srcFiles, e)
+		}
+		var srcFolders []files.Folder
+		fc := foldersB.Cursor()
+		for k, v := fc.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, v = fc.Next() {
+			var f files.Folder
+			if err := json.Unmarshal(v, &f); err != nil {
+				return err
+			}
+			if f.Deleted || !files.IsUnder(f.Path, from) {
+				continue
+			}
+			srcFolders = append(srcFolders, f)
+		}
+
+		// Refuse to clobber anything live at a destination path.
+		for _, e := range srcFiles {
+			np := moveTarget(e.Path, from, to)
+			if liveFileAt(tx, userUUID, np) || liveFolderAt(tx, userUUID, np) {
+				return fmt.Errorf("%w: %s", ErrMoveCollision, np)
+			}
+		}
+		for _, f := range srcFolders {
+			np := moveTarget(f.Path, from, to)
+			if liveFileAt(tx, userUUID, np) || liveFolderAt(tx, userUUID, np) {
+				return fmt.Errorf("%w: %s", ErrMoveCollision, np)
+			}
+		}
+
+		// Move the bytes on disk before touching the index.
+		if userRoot != "" {
+			oldDir := filepath.Join(userRoot, filepath.FromSlash(from))
+			if fi, statErr := os.Stat(oldDir); statErr == nil && fi.IsDir() {
+				newDir := filepath.Join(userRoot, filepath.FromSlash(to))
+				if err := os.MkdirAll(filepath.Dir(newDir), 0o700); err != nil {
+					return err
+				}
+				if err := os.Rename(oldDir, newDir); err != nil {
+					return err
+				}
+			}
+		}
+
+		// The destination's own ancestors must exist as folder records.
+		if err := ensureFoldersTx(tx, userUUID, to); err != nil {
+			return err
+		}
+
+		now := time.Now().UTC()
+		for _, e := range srcFiles {
+			oldKey := fileKey(userUUID, e.Path)
+			if err := removeEntryIndex(tx, filesB.Get(oldKey), userUUID); err != nil {
+				return err
+			}
+			gone := e
+			gone.Deleted = true
+			gone.Size = 0
+			gone.Metadata = nil
+			gone.Links = nil
+			gone.ModTime = now
+			gv, err := nextVersionTx(tx)
+			if err != nil {
+				return err
+			}
+			gone.Version = gv
+			goneRaw, err := json.Marshal(&gone)
+			if err != nil {
+				return err
+			}
+			if err := filesB.Put(oldKey, goneRaw); err != nil {
+				return err
+			}
+			movedFiles = append(movedFiles, gone)
+
+			live := e
+			live.Path = moveTarget(e.Path, from, to)
+			live.ModTime = now
+			lv, err := nextVersionTx(tx)
+			if err != nil {
+				return err
+			}
+			live.Version = lv
+			liveRaw, err := json.Marshal(&live)
+			if err != nil {
+				return err
+			}
+			if err := filesB.Put(fileKey(userUUID, live.Path), liveRaw); err != nil {
+				return err
+			}
+			if err := addEntryIndex(tx, userUUID, &live); err != nil {
+				return err
+			}
+			movedFiles = append(movedFiles, live)
+		}
+
+		for _, f := range srcFolders {
+			oldKey := folderKey(userUUID, f.Path)
+			gone := f
+			gone.Deleted = true
+			gone.ModTime = now
+			gv, err := nextVersionTx(tx)
+			if err != nil {
+				return err
+			}
+			gone.Version = gv
+			goneRaw, err := json.Marshal(&gone)
+			if err != nil {
+				return err
+			}
+			if err := foldersB.Put(oldKey, goneRaw); err != nil {
+				return err
+			}
+			movedFolders = append(movedFolders, gone)
+
+			live := f
+			live.Path = moveTarget(f.Path, from, to)
+			live.ModTime = now
+			lv, err := nextVersionTx(tx)
+			if err != nil {
+				return err
+			}
+			live.Version = lv
+			liveRaw, err := json.Marshal(&live)
+			if err != nil {
+				return err
+			}
+			if err := foldersB.Put(folderKey(userUUID, live.Path), liveRaw); err != nil {
+				return err
+			}
+			movedFolders = append(movedFolders, live)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return movedFiles, movedFolders, nil
+}
+
+// DeleteFolderTree tombstones the folder at from and every descendant folder
+// and file beneath it in a single transaction, returning the affected records
+// (all tombstones). Bytes are removed from disk afterwards, best-effort: an
+// orphaned file left by a failed remove is never served (no live entry points
+// at it) and does not count against quota.
+func (s *Store) DeleteFolderTree(userRoot, userUUID, from string) ([]files.Entry, []files.Folder, error) {
+	var deadFiles []files.Entry
+	var deadFolders []files.Folder
+	err := s.DB.Update(func(tx *bolt.Tx) error {
+		deadFiles, deadFolders = nil, nil
+		filesB := tx.Bucket(BucketFiles)
+		foldersB := tx.Bucket(BucketFolders)
+		prefix := append([]byte(userUUID), fileKeySep...)
+
+		// Collect affected live records first: bbolt forbids mutating a bucket
+		// while iterating it.
+		var srcFiles []files.Entry
+		c := filesB.Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, v = c.Next() {
+			var e files.Entry
+			if err := json.Unmarshal(v, &e); err != nil {
+				return err
+			}
+			if e.Deleted || !files.IsUnder(e.Path, from) {
+				continue
+			}
+			srcFiles = append(srcFiles, e)
+		}
+		var srcFolders []files.Folder
+		fc := foldersB.Cursor()
+		for k, v := fc.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, v = fc.Next() {
+			var f files.Folder
+			if err := json.Unmarshal(v, &f); err != nil {
+				return err
+			}
+			if f.Deleted || !files.IsUnder(f.Path, from) {
+				continue
+			}
+			srcFolders = append(srcFolders, f)
+		}
+
+		now := time.Now().UTC()
+		for _, e := range srcFiles {
+			key := fileKey(userUUID, e.Path)
+			if err := removeEntryIndex(tx, filesB.Get(key), userUUID); err != nil {
+				return err
+			}
+			gone := e
+			gone.Deleted = true
+			gone.Size = 0
+			gone.Metadata = nil
+			gone.Links = nil
+			gone.ModTime = now
+			v, err := nextVersionTx(tx)
+			if err != nil {
+				return err
+			}
+			gone.Version = v
+			raw, err := json.Marshal(&gone)
+			if err != nil {
+				return err
+			}
+			if err := filesB.Put(key, raw); err != nil {
+				return err
+			}
+			deadFiles = append(deadFiles, gone)
+		}
+		for _, f := range srcFolders {
+			key := folderKey(userUUID, f.Path)
+			gone := f
+			gone.Deleted = true
+			gone.ModTime = now
+			v, err := nextVersionTx(tx)
+			if err != nil {
+				return err
+			}
+			gone.Version = v
+			raw, err := json.Marshal(&gone)
+			if err != nil {
+				return err
+			}
+			if err := foldersB.Put(key, raw); err != nil {
+				return err
+			}
+			deadFolders = append(deadFolders, gone)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Remove the subtree's bytes once the index no longer references them.
+	if userRoot != "" && len(deadFiles) > 0 {
+		dir := filepath.Join(userRoot, filepath.FromSlash(from))
+		_ = os.RemoveAll(dir)
+	}
+	return deadFiles, deadFolders, nil
 }
 
 // --- secrets ---

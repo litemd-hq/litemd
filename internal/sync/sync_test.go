@@ -44,7 +44,7 @@ func TestCheck(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := Check(tc.ifMatch, tc.ifNoneMatch, tc.current)
+			err := Check(tc.ifMatch, tc.ifNoneMatch, EntryState(tc.current))
 			switch tc.want {
 			case wantNil:
 				if err != nil {
@@ -75,12 +75,13 @@ func TestCheck(t *testing.T) {
 func TestPreconditionFailureCarriesEntryWhenKnown(t *testing.T) {
 	// "create over live" is a 412 that should still hand back the entry so the
 	// client can retry with the right version.
-	err := Check("", "*", live(7))
+	err := Check("", "*", EntryState(live(7)))
 	var p *PreconditionFailed
 	if !errors.As(err, &p) {
 		t.Fatalf("err = %v, want *PreconditionFailed", err)
 	}
-	if p.Current == nil || p.Current.Version != 7 {
+	e, ok := p.Current.(*files.Entry)
+	if !ok || e == nil || e.Version != 7 {
 		t.Errorf("current = %+v, want version 7", p.Current)
 	}
 }

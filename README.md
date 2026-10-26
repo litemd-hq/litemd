@@ -20,6 +20,8 @@ trusted network as the supported configuration today.
 - Optimistic concurrency on every write: `If-Match: <version>` to update,
   `If-None-Match: *` to create, with tombstones so deletions propagate.
   There is no last-write-wins path; conflicting writes are rejected.
+- First-class folders: empty folders sync between devices, and renaming a
+  folder is a single atomic operation that moves its contents too
 - Markdown-aware: UTF-8 validation and YAML frontmatter metadata
   (`title`, `tags`, arbitrary extras) parsed on upload and returned with
   every file entry
@@ -220,6 +222,41 @@ All file routes require `Authorization: Bearer <access_token>`.
 | `PUT` | `/files/{path}` | Upload a file atomically (requires a precondition) |
 | `DELETE` | `/files/{path}` | Delete a file (tombstone; requires a precondition) |
 
+### Folders
+
+Folders are first-class synced records, not just the directory part of a file
+path. Every folder has its own `path`, `version` and tombstone, so an **empty
+folder syncs between devices** and a folder can be **renamed in one atomic
+operation**. Files and folders are separate resources: a file and a folder may
+not share a path.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/folders` | Folder manifest, including tombstones |
+| `PUT` | `/folders/{path}` | Create (or revive) a folder (`If-None-Match: *`) |
+| `DELETE` | `/folders/{path}` | Delete a folder (`If-Match: <version>`; `?recursive=true` for the whole subtree) |
+| `POST` | `/folders/{path}` | Rename/move a folder and its contents (`If-Match: <version>`) |
+
+Writes use the same preconditions as files (see
+[Concurrency](#concurrency-no-last-write-wins)): `If-None-Match: *` to create,
+`If-Match: <version>` to delete or move.
+
+The tree a client renders is the folders from `GET /folders` plus the file paths
+from `GET /files`. Ancestor folders of a written file are recorded automatically,
+so `PUT /files/notes/a.md` also creates the folder `notes`. By default `DELETE`
+removes only the folder's own record, so a folder that still holds notes stays in
+the tree until those are removed too; pass `?recursive=true` to tombstone the
+whole subtree (every descendant folder and file) and remove its bytes in one
+transaction — the response lists the affected records.
+
+**Move.** `POST /folders/{path}` with body `{"to": "new/path"}` rewrites the
+folder record and every file and folder beneath it in a single transaction,
+renaming the real directory on disk as well. The response lists the affected
+records — a tombstone at each old path and a live entry at each new path — so
+other devices reconcile the change as a delete plus a create (matching file
+`sha256` values reveals the rename). Moving a folder into itself, or onto an
+already-occupied path, is rejected (`412` / `409`).
+
 ### Concurrency (no last-write-wins)
 
 Every write must carry exactly one precondition. Requests without one are
@@ -409,7 +446,7 @@ current entry.
 | 403 | `forbidden` | registration attempted without an admin token |
 | 404 | `not_found` | no such file, or the path is a tombstone |
 | 409 | `conflict`, `username_taken` | version mismatch, or a deleted path |
-| 412 | `precondition_failed` | `If-Match` on an absent path, `If-None-Match` on an existing one, or a malformed precondition |
+| 412 | `precondition_failed`, `path_kind_conflict`, `invalid_move` | `If-Match` on an absent path, `If-None-Match` on an existing one, a file/folder path clash, or a malformed precondition |
 | 413 | `too_large`, `quota_exceeded` | body exceeds `-max-upload`, or the user's quota |
 | 428 | `precondition_required` | a write arrived with no precondition |
 | 429 | `rate_limited` | too many auth attempts; see `Retry-After` |
@@ -504,8 +541,8 @@ it again. On first boot it backfills any missing derived indexes.
 | `internal/config` | flags, environment and JSON config; precedence and validation |
 | `internal/setup` | the `litemd init` wizard |
 | `internal/auth` | Argon2id hashing, JWT access tokens, rotating refresh tokens |
-| `internal/bolt` | the bbolt store: users, tokens, file index, tag/backlink indexes |
-| `internal/files` | path sandbox, atomic writes, Markdown parsing, content-type sniffing |
+| `internal/bolt` | the bbolt store: users, tokens, file and folder records, tag/backlink indexes |
+| `internal/files` | path sandbox, atomic writes, Markdown parsing, content-type sniffing, folder records |
 | `internal/sync` | the optimistic-concurrency precondition rules |
 | `internal/httpapi` | handlers, middleware, routing |
 | `internal/tlsutil` | certificate generation and loading |

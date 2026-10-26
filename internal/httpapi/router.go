@@ -84,6 +84,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/v1/files/{path...}", s.requireAuth(s.handleUpload))
 	mux.HandleFunc("DELETE /api/v1/files/{path...}", s.requireAuth(s.handleDelete))
 
+	// Folders are first-class synced records: GET lists them (tombstones
+	// included), PUT creates an (empty) folder, DELETE tombstones one, and POST
+	// moves/renames a folder and its contents in a single transaction.
+	mux.HandleFunc("GET /api/v1/folders", s.requireAuth(s.handleFolders))
+	mux.HandleFunc("PUT /api/v1/folders/{path...}", s.requireAuth(s.handleFolderPut))
+	mux.HandleFunc("DELETE /api/v1/folders/{path...}", s.requireAuth(s.handleFolderDelete))
+	mux.HandleFunc("POST /api/v1/folders/{path...}", s.requireAuth(s.handleFolderMove))
+
 	// Derived indexes: tags, wikilinks and the note graph.
 	mux.HandleFunc("GET /api/v1/tags", s.requireAuth(s.handleTags))
 	mux.HandleFunc("GET /api/v1/tags/{tag}", s.requireAuth(s.handleTagFiles))

@@ -126,6 +126,12 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A file and a folder cannot occupy the same path.
+	if folder, ferr := s.store.GetFolder(user.UUID, clean); ferr == nil && !folder.Deleted {
+		writeErrorWith(w, http.StatusPreconditionFailed, "path_kind_conflict", "a folder already exists at this path", folder)
+		return
+	}
+
 	entry, getErr := s.store.GetFile(user.UUID, clean)
 	if getErr != nil && !storeNotFound(getErr) {
 		s.log.Error("get file", "err", getErr)
@@ -134,7 +140,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Mutations require an explicit precondition: no last-write-wins.
-	if err := syncpkg.Check(r.Header.Get("If-Match"), r.Header.Get("If-None-Match"), entry); err != nil {
+	if err := syncpkg.Check(r.Header.Get("If-Match"), r.Header.Get("If-None-Match"), syncpkg.EntryState(entry)); err != nil {
 		s.writeSyncError(w, err)
 		return
 	}
@@ -247,7 +253,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "file not found")
 		return
 	}
-	if err := syncpkg.Check(r.Header.Get("If-Match"), "", entry); err != nil {
+	if err := syncpkg.Check(r.Header.Get("If-Match"), "", syncpkg.EntryState(entry)); err != nil {
 		s.writeSyncError(w, err)
 		return
 	}

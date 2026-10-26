@@ -10,8 +10,9 @@ import (
 )
 
 // currentIndexVersion is bumped whenever the derived index layout changes so
-// that existing databases are rebuilt once on startup.
-const currentIndexVersion = 1
+// that existing databases are rebuilt once on startup. Version 2 adds explicit
+// folder records for the ancestors of every existing file.
+const currentIndexVersion = 2
 
 // Reindex rebuilds the tag and backlink indexes from on-disk Markdown files if
 // the stored index version is behind. It is a no-op once up to date.
@@ -22,6 +23,12 @@ func (s *Server) Reindex() error {
 	}
 	if v >= currentIndexVersion {
 		return nil
+	}
+
+	// Give every folder in an existing vault an explicit record, so it syncs
+	// and can be moved. New writes maintain this automatically.
+	if err := s.store.BackfillFolders(); err != nil {
+		return err
 	}
 
 	all, err := s.store.AllFiles()
