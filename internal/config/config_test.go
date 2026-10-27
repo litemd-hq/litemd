@@ -26,6 +26,7 @@ func clearEnv(t *testing.T) {
 		"LITEMD_MAX_UPLOAD", "LITEMD_ACCESS_TTL", "LITEMD_REFRESH_TTL",
 		"LITEMD_TRUSTED_PROXIES", "LITEMD_RATE_LIMIT_BURST",
 		"LITEMD_RATE_LIMIT_REFILL_PER_SEC",
+		"LITEMD_LOG_LEVEL", "LITEMD_LOG_FORMAT", "LITEMD_REGISTRATION",
 	} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
@@ -236,6 +237,74 @@ func TestLogLevel(t *testing.T) {
 	}
 	if cfg.LogLevel != "error" {
 		t.Errorf("log level from env = %q, want error", cfg.LogLevel)
+	}
+}
+
+func TestLogFormat(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.LogFormat != DefaultLogFormat {
+		t.Errorf("default log format = %q, want %q", cfg.LogFormat, DefaultLogFormat)
+	}
+
+	// The format is case insensitive.
+	cfg, err = Parse([]string{"-log-format", "JSON"})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.LogFormat != "json" {
+		t.Errorf("log format = %q, want json", cfg.LogFormat)
+	}
+
+	// Unknown formats are rejected rather than silently ignored.
+	if _, err := Parse([]string{"-log-format", "xml"}); err == nil {
+		t.Error("an unknown log format should be rejected")
+	}
+
+	t.Setenv("LITEMD_LOG_FORMAT", "json")
+	cfg, err = Parse(nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.LogFormat != "json" {
+		t.Errorf("log format from env = %q, want json", cfg.LogFormat)
+	}
+}
+
+func TestRegistration(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Registration != DefaultRegistration {
+		t.Errorf("default registration = %q, want %q", cfg.Registration, DefaultRegistration)
+	}
+
+	// The policy is case insensitive.
+	cfg, err = Parse([]string{"-registration", "OPEN"})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Registration != RegistrationOpen {
+		t.Errorf("registration = %q, want open", cfg.Registration)
+	}
+
+	// Unknown policies are rejected rather than silently ignored.
+	if _, err := Parse([]string{"-registration", "whatever"}); err == nil {
+		t.Error("an unknown registration policy should be rejected")
+	}
+
+	t.Setenv("LITEMD_REGISTRATION", "closed")
+	cfg, err = Parse(nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Registration != RegistrationClosed {
+		t.Errorf("registration from env = %q, want closed", cfg.Registration)
 	}
 }
 

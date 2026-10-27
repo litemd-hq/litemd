@@ -35,6 +35,8 @@ type options struct {
 	maxUpload      string
 	trustedProxies string
 	logLevel       string
+	logFormat      string
+	registration   string
 	adminUser      string
 	adminPass      string
 	force          bool
@@ -169,6 +171,26 @@ func Run(args []string, in Prompter, out, errOut io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if interactive {
+		u.Hint("Format: text is readable in a terminal, json for log shippers.")
+	}
+	logFormat, err := asked("Log format", opts.logFormat, logFormatValidator)
+	if err != nil {
+		return err
+	}
+
+	// --- registration -------------------------------------------------------
+
+	if interactive {
+		u.Step("Registration")
+		u.Hint("open: anyone may register. admin: the first user may register,")
+		u.Hint("then an admin token is required. closed: manage accounts with")
+		u.Hint("`litemd user`.")
+	}
+	registration, err := asked("Registration policy", opts.registration, registrationValidator)
+	if err != nil {
+		return err
+	}
 
 	// --- administrator ------------------------------------------------------
 
@@ -218,6 +240,8 @@ func Run(args []string, in Prompter, out, errOut io.Writer) error {
 		RateLimitBurst:        config.DefaultRateLimitBurst,
 		RateLimitRefillPerSec: config.DefaultRateLimitRefillPerSec,
 		LogLevel:              logLevel,
+		LogFormat:             logFormat,
+		Registration:          registration,
 	}
 	cfg.TrustedProxies = splitProxies(proxies)
 	if err := config.Validate(cfg); err != nil {
@@ -239,6 +263,8 @@ func Run(args []string, in Prompter, out, errOut io.Writer) error {
 		{"max upload", formatSize(cfg.MaxUpload)},
 		{"trusted proxies", orNone(strings.Join(cfg.TrustedProxies, ", "))},
 		{"log level", cfg.LogLevel},
+		{"log format", cfg.LogFormat},
+		{"registration", cfg.Registration},
 		{"administrator", adminLine},
 	})
 
@@ -302,6 +328,8 @@ func parseFlags(args []string, out io.Writer) (*options, error) {
 	fs.StringVar(&o.maxUpload, "max-upload", "64MiB", "maximum upload size, e.g. 64MiB")
 	fs.StringVar(&o.trustedProxies, "trusted-proxies", "", "comma-separated IPs/CIDRs behind which X-Forwarded-For is trusted")
 	fs.StringVar(&o.logLevel, "log-level", config.DefaultLogLevel, "log level: debug, info, warn or error")
+	fs.StringVar(&o.logFormat, "log-format", config.DefaultLogFormat, "log format: text or json")
+	fs.StringVar(&o.registration, "registration", config.DefaultRegistration, "registration policy: open, admin or closed")
 	fs.StringVar(&o.adminUser, "admin-username", "", "create this administrator (skips the prompt)")
 	fs.StringVar(&o.adminPass, "admin-password", "", "administrator password (use with -admin-username)")
 	fs.BoolVar(&o.force, "force", false, "overwrite an existing configuration file")
@@ -341,6 +369,7 @@ func renderConfig(cfg *config.Config) ([]byte, error) {
 		RateLimitBurst        int      `json:"rate_limit_burst"`
 		RateLimitRefillPerSec float64  `json:"rate_limit_refill_per_sec"`
 		LogLevel              string   `json:"log_level"`
+		LogFormat             string   `json:"log_format"`
 	}
 	b, err := json.MarshalIndent(out{
 		Addr:                  cfg.Addr,
@@ -356,6 +385,7 @@ func renderConfig(cfg *config.Config) ([]byte, error) {
 		RateLimitBurst:        cfg.RateLimitBurst,
 		RateLimitRefillPerSec: cfg.RateLimitRefillPerSec,
 		LogLevel:              cfg.LogLevel,
+		LogFormat:             cfg.LogFormat,
 	}, "", "  ")
 	if err != nil {
 		return nil, err
@@ -400,7 +430,14 @@ func createAdmin(cfg *config.Config, username, password string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := svc.Register(username, password, cfg.QuotaBytes); err != nil {
+	if _, err := svc.Register(auth.RegisterOptions{
+		Username:        username,
+		Password:        password,
+		Quota:           cfg.QuotaBytes,
+		IsAdmin:         true,
+		AdminAuthorized: true,
+		Open:            true,
+	}); err != nil {
 		return err
 	}
 	return nil
@@ -437,6 +474,26 @@ func logLevelValidator(s string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("choose one of: %s", strings.Join(config.LogLevels, ", "))
+}
+
+func logFormatValidator(s string) (string, error) {
+	f := strings.ToLower(strings.TrimSpace(s))
+	for _, allowed := range config.LogFormats {
+		if f == allowed {
+			return f, nil
+		}
+	}
+	return "", fmt.Errorf("choose one of: %s", strings.Join(config.LogFormats, ", "))
+}
+
+func registrationValidator(s string) (string, error) {
+	r := strings.ToLower(strings.TrimSpace(s))
+	for _, allowed := range config.Registrations {
+		if r == allowed {
+			return r, nil
+		}
+	}
+	return "", fmt.Errorf("choose one of: %s", strings.Join(config.Registrations, ", "))
 }
 
 func sizeValidator(s string) (string, error) {

@@ -201,6 +201,11 @@ func TestRevokeAllForUserIsScoped(t *testing.T) {
 		{"h2", "u1", "f2"},
 		{"h3", "u2", "f3"},
 	} {
+		if err := s.PutSession(&SessionMeta{
+			UserUUID: rec.user, Family: rec.family, CreatedAt: time.Now(), LastSeen: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
 		if err := s.SaveRefresh(rec.hash, &RefreshRecord{
 			UserUUID: rec.user, Family: rec.family, Expires: time.Now().Add(time.Hour),
 		}); err != nil {
@@ -221,15 +226,21 @@ func TestRevokeAllForUserIsScoped(t *testing.T) {
 	if _, err := s.GetRefresh("h1"); !errors.Is(err, ErrNotFound) {
 		t.Error("u1's token should be gone")
 	}
+	if _, err := s.GetSession("f1"); !errors.Is(err, ErrNotFound) {
+		t.Error("u1's session should be gone")
+	}
+	if _, err := s.GetSession("f3"); err != nil {
+		t.Errorf("another user's session was revoked: %v", err)
+	}
 }
 
 func TestUsernameIsUniqueCaseSensitively(t *testing.T) {
 	s := testStore(t)
 	u := &User{UUID: "id1", Username: "alice", Argon2: "x", Quota: 1, CreatedAt: time.Now()}
-	if err := s.CreateUser(u); err != nil {
+	if err := s.CreateUser(u, true, true); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := s.CreateUser(&User{UUID: "id2", Username: "alice", Argon2: "y", Quota: 1}); err == nil {
+	if err := s.CreateUser(&User{UUID: "id2", Username: "alice", Argon2: "y", Quota: 1}, true, true); err == nil {
 		t.Error("duplicate username should be rejected")
 	}
 	n, err := s.CountUsers()
@@ -242,32 +253,172 @@ func TestUsernameIsUniqueCaseSensitively(t *testing.T) {
 	}
 }
 
-func TestJWTSecretIsStable(t *testing.T) {
-	dir := t.TempDir()
-	s, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first, err := s.JWTSecret()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(first) != 32 {
-		t.Errorf("secret length = %d, want 32", len(first))
-	}
-	_ = s.Close()
+func TestCreateUserRegistrationGate(t *testing.T) {
+	s := testStore(t)
 
-	// Reopening must return the same secret, or every token would be invalidated.
-	s2, err := Open(dir)
+	// The first user is always allowed and always becomes the admin.
+	first := &User{UUID: "id1", Username: "alice", Argon2: "x"}
+	if err := s.CreateUser(first, false, false); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if !first.IsAdmin {
+		t.Error("the first user must become the admin")
+	}
+
+	// A later self-registration is refused under the admin policy.
+	if err := s.CreateUser(&User{UUID: "id2", Username: "bob", Argon2: "y"}, false, false); !errors.Is(err, ErrRegistrationClosed) {
+		t.Errorf("second create err = %v, want ErrRegistrationClosed", err)
+	}
+	// An admin-authorized create is allowed.
+	if err := s.CreateUser(&User{UUID: "id2", Username: "bob", Argon2: "y"}, true, false); err != nil {
+		t.Errorf("admin create: %v", err)
+	}
+	// The open policy allows anyone.
+	if err := s.CreateUser(&User{UUID: "id3", Username: "carol", Argon2: "z"}, false, true); err != nil {
+		t.Errorf("open create: %v", err)
+	}
+}
+
+func TestUpdateUserGuardsLastAdmin(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateUser(&User{UUID: "id1", Username: "alice"}, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateUser(&User{UUID: "id2", Username: "bob", IsAdmin: true}, true, true); err != nil {
+		t.Fatal(err)
+	}
+	no := false
+	// Demoting one of two admins is fine.
+	if _, err := s.UpdateUser("id2", nil, &no); err != nil {
+		t.Fatalf("demote one admin: %v", err)
+	}
+	// Demoting the last admin is refused.
+	if _, err := s.UpdateUser("id1", nil, &no); !errors.Is(err, ErrLastAdmin) {
+		t.Errorf("demote last admin err = %v, want ErrLastAdmin", err)
+	}
+	// Deleting the last admin is refused too.
+	if err := s.DeleteUser("id1"); !errors.Is(err, ErrLastAdmin) {
+		t.Errorf("delete last admin err = %v, want ErrLastAdmin", err)
+	}
+}
+
+func TestUpdateUserUsername(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateUser(&User{UUID: "id1", Username: "alice"}, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateUser(&User{UUID: "id2", Username: "bob"}, true, true); err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := s.UpdateUserUsername("id1", "alice2")
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if u.Username != "alice2" {
+		t.Errorf("username = %q, want alice2", u.Username)
+	}
+	// The old name is free and the new one resolves.
+	if _, err := s.UserByUsername("alice"); !errors.Is(err, ErrNotFound) {
+		t.Error("the old name should be free after a rename")
+	}
+	if got, err := s.UserByUsername("alice2"); err != nil || got.UUID != "id1" {
+		t.Errorf("lookup by new name = %+v, %v", got, err)
+	}
+	// A name in use is rejected.
+	if _, err := s.UpdateUserUsername("id1", "bob"); !errors.Is(err, ErrUsernameTaken) {
+		t.Errorf("collision err = %v, want ErrUsernameTaken", err)
+	}
+	// Renaming to the current name is a no-op.
+	if _, err := s.UpdateUserUsername("id1", "alice2"); err != nil {
+		t.Errorf("same-name rename: %v", err)
+	}
+	// An unknown user is reported.
+	if _, err := s.UpdateUserUsername("nobody", "x"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown user err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeleteUserCascades(t *testing.T) {
+	s := testStore(t)
+	// A second admin exists so deleting alice is not blocked by the last-admin guard.
+	if err := s.CreateUser(&User{UUID: "id0", Username: "root", IsAdmin: true}, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateUser(&User{UUID: "id1", Username: "alice"}, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutFile("id1", entry("note.md", 10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSession(&SessionMeta{UserUUID: "id1", Family: "fam", CreatedAt: time.Now(), LastSeen: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveRefresh("rh", &RefreshRecord{UserUUID: "id1", Family: "fam", Expires: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SavePAT("ph", &PATRecord{ID: "pat1", UserUUID: "id1", Name: "laptop", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteUser("id1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := s.UserByUUID("id1"); !errors.Is(err, ErrNotFound) {
+		t.Error("user should be gone")
+	}
+	if _, err := s.UserByUsername("alice"); !errors.Is(err, ErrNotFound) {
+		t.Error("username index should be gone")
+	}
+	if manifest, _ := s.Manifest("id1"); len(manifest) != 0 {
+		t.Errorf("files survived delete: %v", manifest)
+	}
+	if _, err := s.GetSession("fam"); !errors.Is(err, ErrNotFound) {
+		t.Error("session survived delete")
+	}
+	if _, err := s.GetRefresh("rh"); !errors.Is(err, ErrNotFound) {
+		t.Error("refresh token survived delete")
+	}
+	if _, err := s.GetPAT("ph"); !errors.Is(err, ErrNotFound) {
+		t.Error("personal token survived delete")
+	}
+}
+
+func TestPurgeExpiredRemovesDeadRecords(t *testing.T) {
+	s := testStore(t)
+	now := time.Now()
+	past := now.Add(-time.Hour)
+
+	if err := s.SaveAccess("dead-access", &AccessRecord{UserUUID: "u", Family: "f", Expires: past}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveRefresh("dead-refresh", &RefreshRecord{UserUUID: "u", Family: "f", Expires: past}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSession(&SessionMeta{UserUUID: "u", Family: "f", CreatedAt: past, LastSeen: past}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SavePAT("dead-pat", &PATRecord{ID: "p", UserUUID: "u", Expires: past}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.PurgeExpired(now, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s2.Close()
-	second, err := s2.JWTSecret()
-	if err != nil {
-		t.Fatal(err)
+	if n < 4 {
+		t.Errorf("purged = %d, want >= 4", n)
 	}
-	if string(first) != string(second) {
-		t.Error("JWT secret changed across restarts")
+	if _, err := s.GetAccess("dead-access"); !errors.Is(err, ErrNotFound) {
+		t.Error("expired access token survived")
+	}
+	if _, err := s.GetRefresh("dead-refresh"); !errors.Is(err, ErrNotFound) {
+		t.Error("expired refresh token survived")
+	}
+	if _, err := s.GetSession("f"); !errors.Is(err, ErrNotFound) {
+		t.Error("stale session survived")
+	}
+	if _, err := s.GetPAT("dead-pat"); !errors.Is(err, ErrNotFound) {
+		t.Error("expired personal token survived")
 	}
 }

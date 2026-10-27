@@ -18,6 +18,8 @@ tags:
     description: First-class folder records so empty folders sync and renames are atomic.
   - name: Index
     description: Derived tag, wikilink and graph indexes.
+  - name: Users
+    description: Administrator-only account management.
 
 paths:
   /healthz:
@@ -160,6 +162,424 @@ paths:
                     type: integer
         '401':
           $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/auth/me:
+    get:
+      summary: Current user profile
+      description: >
+        Returns the authenticated user's profile, quota and used bytes. A
+        personal API token authenticates here exactly like a session token.
+      tags: [Authentication]
+      responses:
+        '200':
+          description: Profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/auth/password:
+    post:
+      summary: Change the current user's password
+      description: >
+        Verifies the current password, stores the new one, revokes every session
+        (access and refresh tokens die immediately) and returns a fresh token
+        pair for the caller.
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password:
+                  type: string
+                new_password:
+                  type: string
+                  minLength: 8
+      responses:
+        '200':
+          description: New token pair for the caller
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/username:
+    post:
+      summary: Change the current user's username
+      description: >
+        Confirms the current password before renaming. Existing sessions stay
+        valid (tokens are keyed by user id, not name).
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  minLength: 3
+                  maxLength: 32
+                  pattern: '^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$'
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Updated user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Username already taken
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/sessions:
+    get:
+      summary: List active sessions
+      tags: [Authentication]
+      responses:
+        '200':
+          description: Sessions, most recently seen first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/auth/sessions/{id}:
+    delete:
+      summary: Revoke one session
+      tags: [Authentication]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Session id (the token family) from the sessions list.
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Session revoked; its access tokens stop working at once
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/auth/tokens:
+    get:
+      summary: List personal API tokens
+      tags: [Authentication]
+      responses:
+        '200':
+          description: Tokens (secrets omitted)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tokens]
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PersonalToken'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      summary: Create a personal API token
+      description: >
+        Mints a long-lived bearer token for scripts and headless clients. The
+        secret is returned once and never again.
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  maxLength: 64
+                expires_in:
+                  type: integer
+                  format: int64
+                  description: Lifetime in seconds; 0 means no expiry.
+      responses:
+        '201':
+          description: Created token (with the secret)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonalToken'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/tokens/{id}:
+    delete:
+      summary: Revoke a personal API token
+      tags: [Authentication]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Token revoked
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/users:
+    get:
+      summary: List users (admin)
+      tags: [Users]
+      responses:
+        '200':
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [users]
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdminUser'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      summary: Create a user (admin)
+      description: >
+        Bypasses the registration policy: an admin may always create accounts,
+        with an optional quota and admin flag.
+      tags: [Users]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  minLength: 3
+                  maxLength: 32
+                password:
+                  type: string
+                  minLength: 8
+                quota_bytes:
+                  type: integer
+                  format: int64
+                is_admin:
+                  type: boolean
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUser'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Username already taken
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/users/{uuid}:
+    parameters:
+      - name: uuid
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get a user (admin)
+      tags: [Users]
+      responses:
+        '200':
+          description: User
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUser'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      summary: Update a user's username, quota or admin flag (admin)
+      description: Omitted fields are left unchanged. Demoting the last administrator returns 409.
+      tags: [Users]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                  minLength: 3
+                  maxLength: 32
+                  pattern: '^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$'
+                quota_bytes:
+                  type: integer
+                  format: int64
+                is_admin:
+                  type: boolean
+      responses:
+        '200':
+          description: Updated user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUser'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Refused because it would remove the last administrator
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Delete a user and their files (admin)
+      tags: [Users]
+      responses:
+        '204':
+          description: Deleted
+        '400':
+          description: Attempted to delete your own account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Refused because it would delete the last administrator
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/users/{uuid}/password:
+    parameters:
+      - name: uuid
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Reset a user's password (admin)
+      description: Sets a new password and signs the user out of every device.
+      tags: [Users]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password:
+                  type: string
+                  minLength: 8
+      responses:
+        '204':
+          description: Password reset and sessions revoked
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/users/{uuid}/revoke:
+    parameters:
+      - name: uuid
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Sign a user out of every device (admin)
+      tags: [Users]
+      responses:
+        '200':
+          description: Count of revoked refresh tokens
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /api/v1/files:
     get:
@@ -655,7 +1075,10 @@ components:
     BearerAuth:
       type: http
       scheme: bearer
-      bearerFormat: JWT
+      description: >
+        An opaque session access token (from /auth/login or /auth/refresh) or a
+        personal API token (from /auth/tokens). Both are sent as
+        `Authorization: Bearer <token>`.
 
   parameters:
     Path:
@@ -716,6 +1139,94 @@ components:
         quota_bytes:
           type: integer
           format: int64
+
+    Me:
+      type: object
+      required: [uuid, username, is_admin, quota_bytes, used_bytes, created_at]
+      properties:
+        uuid:
+          type: string
+        username:
+          type: string
+        is_admin:
+          type: boolean
+        quota_bytes:
+          type: integer
+          format: int64
+          description: 0 means unlimited.
+        used_bytes:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+
+    AdminUser:
+      type: object
+      required: [uuid, username, is_admin, quota_bytes, used_bytes, created_at]
+      properties:
+        uuid:
+          type: string
+        username:
+          type: string
+        is_admin:
+          type: boolean
+        quota_bytes:
+          type: integer
+          format: int64
+        used_bytes:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+
+    Session:
+      type: object
+      description: >
+        One login session. Its id is the token family; deleting it revokes every
+        access and refresh token the session ever issued.
+      required: [id, created_at, last_seen, current]
+      properties:
+        id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+        user_agent:
+          type: string
+        ip:
+          type: string
+        current:
+          type: boolean
+          description: True for the session that served this request.
+
+    PersonalToken:
+      type: object
+      description: >
+        A long-lived bearer token for scripts. `token` is present only in the
+        create response.
+      required: [id, name, created_at, last_seen]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: Omitted when the token never expires.
+        token:
+          type: string
 
     TokenPair:
       type: object
@@ -888,6 +1399,12 @@ components:
             $ref: '#/components/schemas/Error'
     Unauthorized:
       description: Missing or invalid credentials
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Authenticated but not permitted (for example, not an admin)
       content:
         application/json:
           schema:

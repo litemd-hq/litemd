@@ -3,8 +3,9 @@ package setup
 import (
 	"fmt"
 	"io"
-	"os"
 	"strings"
+
+	"github.com/litemd-hq/litemd/internal/tty"
 )
 
 // Style renders terminal output. Both knobs default to "off" so that piped or
@@ -18,38 +19,9 @@ type Style struct {
 // the locale. No dependency on a terminal library is needed for this.
 func detectStyle(out io.Writer, getenv func(string) string) Style {
 	return Style{
-		Color:   isTerminal(out) && getenv("NO_COLOR") == "" && getenv("TERM") != "dumb",
-		Unicode: localeIsUTF8(getenv),
+		Color:   tty.ColorEnabled(out, getenv),
+		Unicode: tty.UTF8(getenv),
 	}
-}
-
-func isTerminal(w io.Writer) bool {
-	f, ok := w.(*os.File)
-	if !ok {
-		return false
-	}
-	info, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
-}
-
-// localeIsUTF8 reports whether the environment suggests a UTF-8 terminal.
-// An unset locale is treated as UTF-8 (the usual modern default).
-func localeIsUTF8(getenv func(string) string) bool {
-	for _, key := range []string{"LC_ALL", "LC_CTYPE", "LANG"} {
-		v := getenv(key)
-		if v == "" {
-			continue
-		}
-		lower := strings.ToLower(v)
-		if lower == "c" || lower == "posix" {
-			return false
-		}
-		return strings.Contains(lower, "utf-8") || strings.Contains(lower, "utf8")
-	}
-	return true
 }
 
 func (s Style) wrap(code, text string) string {

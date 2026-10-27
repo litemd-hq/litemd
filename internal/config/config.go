@@ -27,10 +27,33 @@ const (
 	// DefaultLogLevel keeps per-request logging on; raise it to reduce writes
 	// to slow or wear-sensitive storage such as an SD card.
 	DefaultLogLevel = "info"
+
+	// DefaultLogFormat renders logs for humans; switch to "json" for
+	// machine-consumed output (journald, log shippers).
+	DefaultLogFormat = "text"
+
+	// Registration policy values. RegistrationAdmin preserves the historical
+	// behavior: the first user of an empty database may register, and every
+	// later registration needs an admin token. RegistrationOpen lets anyone
+	// register at any time (the first user still becomes the admin); the first
+	// user is always allowed unless the policy is RegistrationClosed, which
+	// rejects HTTP registration entirely (manage accounts with `litemd user`).
+	RegistrationOpen   = "open"
+	RegistrationAdmin  = "admin"
+	RegistrationClosed = "closed"
+
+	// DefaultRegistration is the registration policy used when none is set.
+	DefaultRegistration = RegistrationAdmin
 )
 
 // LogLevels are the accepted values for the log level setting.
 var LogLevels = []string{"debug", "info", "warn", "error"}
+
+// LogFormats are the accepted values for the log format setting.
+var LogFormats = []string{"text", "json"}
+
+// Registrations are the accepted values for the registration policy setting.
+var Registrations = []string{RegistrationOpen, RegistrationAdmin, RegistrationClosed}
 
 const configEnv = "LITEMD_CONFIG"
 
@@ -56,6 +79,13 @@ type Config struct {
 
 	// LogLevel is one of debug, info, warn or error.
 	LogLevel string
+
+	// LogFormat is one of text or json.
+	LogFormat string
+
+	// Registration is one of open, admin or closed; it controls how new users
+	// may be created over HTTP.
+	Registration string
 }
 
 // duration accepts either a Go duration string ("15m", "168h") or a raw
@@ -97,6 +127,8 @@ type fileConfig struct {
 	RateLimitBurst        *int     `json:"rate_limit_burst"`
 	RateLimitRefillPerSec *float64 `json:"rate_limit_refill_per_sec"`
 	LogLevel              *string  `json:"log_level"`
+	LogFormat             *string  `json:"log_format"`
+	Registration          *string  `json:"registration"`
 }
 
 // builtin returns the compiled-in defaults, used for every value not supplied
@@ -112,6 +144,8 @@ func builtin() *Config {
 		RateLimitBurst:        DefaultRateLimitBurst,
 		RateLimitRefillPerSec: DefaultRateLimitRefillPerSec,
 		LogLevel:              DefaultLogLevel,
+		LogFormat:             DefaultLogFormat,
+		Registration:          DefaultRegistration,
 	}
 }
 
@@ -170,6 +204,8 @@ func newFlagSet(fv *flagConfig) *flag.FlagSet {
 	fs.IntVar(&fv.rateLimitBurst, "rate-limit-burst", DefaultRateLimitBurst, "auth rate limit burst per client")
 	fs.Float64Var(&fv.rateLimitRefill, "rate-limit-refill-per-sec", DefaultRateLimitRefillPerSec, "auth rate limit token refill per second")
 	fs.StringVar(&fv.logLevel, "log-level", DefaultLogLevel, "log level: debug, info, warn or error")
+	fs.StringVar(&fv.logFormat, "log-format", DefaultLogFormat, "log format: text or json")
+	fs.StringVar(&fv.registration, "registration", DefaultRegistration, "registration policy: open, admin or closed")
 	return fs
 }
 
@@ -232,6 +268,12 @@ func applyFile(cfg *Config, path string) error {
 	}
 	if fc.LogLevel != nil {
 		cfg.LogLevel = *fc.LogLevel
+	}
+	if fc.LogFormat != nil {
+		cfg.LogFormat = *fc.LogFormat
+	}
+	if fc.Registration != nil {
+		cfg.Registration = *fc.Registration
 	}
 	return nil
 }
@@ -304,6 +346,12 @@ func applyEnv(cfg *Config) error {
 	if v, ok := os.LookupEnv("LITEMD_LOG_LEVEL"); ok {
 		cfg.LogLevel = v
 	}
+	if v, ok := os.LookupEnv("LITEMD_LOG_FORMAT"); ok {
+		cfg.LogFormat = v
+	}
+	if v, ok := os.LookupEnv("LITEMD_REGISTRATION"); ok {
+		cfg.Registration = v
+	}
 	return nil
 }
 
@@ -322,6 +370,8 @@ type flagConfig struct {
 	rateLimitBurst  int
 	rateLimitRefill float64
 	logLevel        string
+	logFormat       string
+	registration    string
 }
 
 func applyFlags(cfg *Config, fv *flagConfig, set map[string]bool) {
@@ -364,6 +414,12 @@ func applyFlags(cfg *Config, fv *flagConfig, set map[string]bool) {
 	if set["log-level"] {
 		cfg.LogLevel = fv.logLevel
 	}
+	if set["log-format"] {
+		cfg.LogFormat = fv.logFormat
+	}
+	if set["registration"] {
+		cfg.Registration = fv.registration
+	}
 }
 
 // Validate checks a fully-resolved configuration for internal consistency. It
@@ -404,6 +460,17 @@ func validate(cfg *Config) (*Config, error) {
 	}
 	if !slices.Contains(LogLevels, cfg.LogLevel) {
 		return nil, fmt.Errorf("log-level must be one of %s", strings.Join(LogLevels, ", "))
+	}
+	cfg.LogFormat = strings.ToLower(strings.TrimSpace(cfg.LogFormat))
+	if !slices.Contains(LogFormats, cfg.LogFormat) {
+		return nil, fmt.Errorf("log-format must be one of %s", strings.Join(LogFormats, ", "))
+	}
+	cfg.Registration = strings.ToLower(strings.TrimSpace(cfg.Registration))
+	if cfg.Registration == "" {
+		cfg.Registration = DefaultRegistration
+	}
+	if !slices.Contains(Registrations, cfg.Registration) {
+		return nil, fmt.Errorf("registration must be one of %s", strings.Join(Registrations, ", "))
 	}
 	return cfg, nil
 }

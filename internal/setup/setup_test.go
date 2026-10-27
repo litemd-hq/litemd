@@ -151,20 +151,23 @@ func TestInteractiveWizard(t *testing.T) {
 	data := filepath.Join(dir, "data")
 
 	// Answers, in order: data dir, addr, quota, max upload, tls mode,
-	// trusted proxies, create-admin?, username, password x2, write? yes.
+	// trusted proxies, log level, log format, registration, create-admin?,
+	// username, password x2, write? yes.
 	outText, err := run(t, []string{"-out", out},
 		data,
 		":9443",
 		"500MiB",
 		"32MiB",
 		"self-signed",
-		"",     // trusted proxies
-		"warn", // log level
-		"y",
-		"alice",
+		"",      // trusted proxies
+		"warn",  // log level
+		"json",  // log format
+		"admin", // registration policy
+		"y",     // create an administrator
+		"alice", // username
 		"password123",
 		"password123",
-		"y",
+		"y", // write
 	)
 	if err != nil {
 		t.Fatalf("Run: %v\n%s", err, outText)
@@ -182,6 +185,9 @@ func TestInteractiveWizard(t *testing.T) {
 	}
 	if m["log_level"] != "warn" {
 		t.Errorf("log_level = %v, want warn", m["log_level"])
+	}
+	if m["log_format"] != "json" {
+		t.Errorf("log_format = %v, want json", m["log_format"])
 	}
 }
 
@@ -201,8 +207,10 @@ func TestInteractiveValidationReprompts(t *testing.T) {
 		"self-signed",
 		"",     // trusted proxies
 		"info", // log level
-		"n",
-		"y",
+		"",     // log format (default)
+		"",     // registration policy (default)
+		"n",    // no administrator
+		"y",    // write
 	)
 	if err != nil {
 		t.Fatalf("Run: %v\n%s", err, outText)
@@ -231,8 +239,10 @@ func TestInteractiveInsecureTLS(t *testing.T) {
 		"insecure",
 		"",     // trusted proxies
 		"info", // log level
-		"n",
-		"y",
+		"",     // log format (default)
+		"",     // registration policy (default)
+		"n",    // no administrator
+		"y",    // write
 	)
 	if err != nil {
 		t.Fatalf("Run: %v\n%s", err, outText)
@@ -258,6 +268,8 @@ func TestInteractiveDeclineWritesNothing(t *testing.T) {
 		"self-signed",
 		"",     // trusted proxies
 		"info", // log level
+		"",     // log format (default)
+		"",     // registration policy (default)
 		"n",    // no administrator
 		"n",    // do not write
 	)

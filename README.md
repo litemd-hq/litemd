@@ -6,16 +6,22 @@ A lightweight, single-binary sync server for Markdown notes.
 
 Early and self-host-focused. It is actively used and tested but **not
 production-hardened** yet: TLS is self-signed unless you supply a certificate,
-rate limiting is in-process, access tokens cannot be revoked before they expire,
-and the API may change before 1.0. Treat deployments behind a VPN or on a
-trusted network as the supported configuration today.
+rate limiting is in-process, and the API may change before 1.0. Treat
+deployments behind a VPN or on a trusted network as the supported configuration
+today.
 
 ## Features
 
 - Single self-contained binary (embedded database, no external services)
 - Per-user sandboxes with one folder per user
-- JWT auth: short-lived access tokens plus rotating refresh tokens
-  (refresh-token reuse revokes the whole token family)
+- Opaque session tokens: short-lived access tokens plus rotating refresh
+  tokens, revocable instantly per session or everywhere (refresh-token reuse
+  revokes the whole session)
+- Self-service accounts: profile and usage (`/auth/me`), password change,
+  session listing and revocation, and personal API tokens for scripts
+- Admin account management over HTTP (`/api/v1/users`) and from the host
+  (`litemd user add|list|passwd|quota|delete|...`)
+- A registration policy per instance: `open`, `admin` (default) or `closed`
 - Atomic, crash-safe writes (write-temp + fsync + rename)
 - Optimistic concurrency on every write: `If-Match: <version>` to update,
   `If-None-Match: *` to create, with tombstones so deletions propagate.
@@ -63,6 +69,7 @@ litemd init
   config file         /etc/litemd/config.json
   data directory      /srv/litemd
   quota per user      1 GiB
+  registration        admin
   administrator       alice
   ──────────────────────
   ✓ wrote /etc/litemd/config.json
@@ -89,6 +96,7 @@ ASCII with no colour when piped, so it is safe to log.
 ```bash
 litemd help                  # list commands and server flags
 litemd init                  # interactive setup (writes a config, creates the admin)
+litemd user list             # manage accounts from the host (server must be stopped)
 litemd                       # start the server
 litemd -version              # print the version
 ```
@@ -109,12 +117,14 @@ litemd -addr ":8443" -data /path/to/data
 | `-insecure` | `false` | Serve plain HTTP; use only behind a TLS-terminating proxy |
 | `-quota-bytes` | 1 GiB | Per-user storage quota |
 | `-max-upload` | 64 MiB | Maximum accepted upload size |
-| `-access-ttl` | `15m` | Access token lifetime |
+| `-access-ttl` | `15m` | Access token lifetime (revocation is instant, so this is not a security ceiling) |
 | `-refresh-ttl` | `168h` | Refresh token lifetime |
 | `-trusted-proxies` | none | Comma-separated IPs/CIDRs whose `X-Forwarded-For` is trusted |
 | `-rate-limit-burst` | `10` | Auth requests allowed in a burst per client |
 | `-rate-limit-refill-per-sec` | `0.1` | Auth rate limit token refill per second |
 | `-log-level` | `info` | `debug`, `info`, `warn` or `error` |
+| `-log-format` | `text` | `text` (human-readable, coloured on a terminal) or `json` |
+| `-registration` | `admin` | How new users register: `open`, `admin` or `closed` |
 
 ### Configuration file
 
@@ -135,7 +145,9 @@ with `-config /etc/litemd/config.json` or `LITEMD_CONFIG`:
   "trusted_proxies": ["127.0.0.1/32", "::1/128"],
   "rate_limit_burst": 10,
   "rate_limit_refill_per_sec": 0.1,
-  "log_level": "info"
+  "log_level": "info",
+  "log_format": "text",
+  "registration": "admin"
 }
 ```
 
@@ -156,6 +168,18 @@ environment while sharing the rest of the file.
 
 All settings are also available as `LITEMD_*` environment variables
 (e.g. `LITEMD_ADDR`, `LITEMD_DATA_DIR`, `LITEMD_CONFIG`).
+
+### Logging
+
+Every server launch prints an ASCII wordmark followed by a startup line, and
+each request logs one line. The default `text` format is built for humans:
+`HH:MM:SS LEVEL message key=value`, with the level colour-coded (green info,
+yellow warn, red error). Colour is applied only when stderr is a terminal and
+`NO_COLOR` is unset and `TERM` is not `dumb`, so piped, redirected and journald
+output stays plain and `grep`-friendly. Set `-log-format json` (or
+`"log_format": "json"`) to get the structured JSON lines that log shippers
+expect. Raise `-log-level` to `warn` or `error` to cut writes on slow or
+wear-sensitive storage.
 
 ### TLS
 
@@ -187,15 +211,28 @@ bucket and a single attacker can lock everyone out.
 
 ### Sessions and revocation
 
-Two tokens are issued at login: a short-lived **access token** (sent as
-`Authorization: Bearer`) and a long-lived **refresh token** that rotates on
-every use. Re-presenting a consumed refresh token is treated as theft and
-revokes the whole family.
+Both tokens are **opaque** strings the server stores only as hashes (not JWTs).
+A login starts a **session** that owns a short-lived **access token** (sent as
+`Authorization: Bearer`) and a long-lived **refresh token** that rotates on every
+use. Re-presenting a consumed refresh token is treated as theft and revokes the
+whole session.
 
-`POST /api/v1/auth/revoke-all` (authenticated) deletes every refresh token for
-the account, signing it out on all devices. Access tokens already issued remain
-valid until they expire, which is why `-access-ttl` defaults to 15 minutes;
-raise it only if you accept a longer revocation window.
+Revocation is immediate, with no access-token window:
+
+- `DELETE /api/v1/auth/sessions/{id}` ends one session.
+- `POST /api/v1/auth/password` changes the password, revokes every session and
+  returns a fresh pair.
+- `POST /api/v1/auth/revoke-all` signs the account out everywhere.
+
+An access token is honored only while its session still exists, so deleting the
+session kills its access tokens too. Expired tokens and dead sessions are purged
+hourly on the server.
+
+### Personal API tokens
+
+For scripts and headless clients, mint a long-lived bearer token with
+`POST /api/v1/auth/tokens` (the secret is returned once). It authenticates like a
+session token but never rotates; revoke it with `DELETE /api/v1/auth/tokens/{id}`.
 
 ## API
 
@@ -205,11 +242,37 @@ Base path: `/api/v1`. Full contract: [`api/openapi.yaml`](api/openapi.yaml).
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `POST` | `/auth/register` | Register a user (first user becomes admin) |
+| `POST` | `/auth/register` | Register a user (subject to the registration policy) |
 | `POST` | `/auth/login` | Obtain an access/refresh token pair |
 | `POST` | `/auth/refresh` | Rotate the refresh token |
-| `POST` | `/auth/logout` | Invalidate a refresh token |
+| `POST` | `/auth/logout` | End the session that owns a refresh token |
+| `GET` | `/auth/me` | Current profile, quota and used bytes |
+| `POST` | `/auth/password` | Change your password (revokes all sessions) |
+| `POST` | `/auth/username` | Change your username (confirms your password) |
+| `GET` | `/auth/sessions` | List active sessions |
+| `DELETE` | `/auth/sessions/{id}` | Revoke one session |
+| `GET` | `/auth/tokens` | List personal API tokens |
+| `POST` | `/auth/tokens` | Create a personal API token |
+| `DELETE` | `/auth/tokens/{id}` | Revoke a personal API token |
 | `POST` | `/auth/revoke-all` | Sign out of every device (auth required) |
+
+### Users (admin only)
+
+An admin manages accounts over HTTP with `Authorization: Bearer <admin token>`:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/users` | List users with quota and usage |
+| `POST` | `/users` | Create a user (bypasses the registration policy) |
+| `GET` | `/users/{uuid}` | Get one user |
+| `PATCH` | `/users/{uuid}` | Rename, and/or set quota and admin flag |
+| `DELETE` | `/users/{uuid}` | Delete a user and their files |
+| `POST` | `/users/{uuid}/password` | Reset a user's password |
+| `POST` | `/users/{uuid}/revoke` | Sign a user out everywhere |
+
+The same operations are available from the host with `litemd user` (stop the
+server first; the database takes an exclusive lock). The first user is always
+the admin, and the last admin cannot be deleted or demoted.
 
 ### Files
 
@@ -540,7 +603,7 @@ it again. On first boot it backfills any missing derived indexes.
 | `cmd/litemd` | entry point, subcommand dispatch (`init`, `help`, `-version`) |
 | `internal/config` | flags, environment and JSON config; precedence and validation |
 | `internal/setup` | the `litemd init` wizard |
-| `internal/auth` | Argon2id hashing, JWT access tokens, rotating refresh tokens |
+| `internal/auth` | Argon2id hashing, opaque session tokens, rotating refresh tokens, personal API tokens |
 | `internal/bolt` | the bbolt store: users, tokens, file and folder records, tag/backlink indexes |
 | `internal/files` | path sandbox, atomic writes, Markdown parsing, content-type sniffing, folder records |
 | `internal/sync` | the optimistic-concurrency precondition rules |
@@ -612,7 +675,7 @@ it if you are the only committer and always run the suite locally before pushing
 
 | Symptom | Cause and fix |
 | --- | --- |
-| Every request is `401` | The access token expired (15 m by default) — refresh it. Note the value is a real JWT, not the file `ETag`. |
+| Every request is `401` | The access token expired (15 m by default) or its session was revoked — refresh it, or log in again. Note the value is a bearer token, not the file `ETag`. |
 | `428 precondition_required` | You sent a write without `If-Match` or `If-None-Match`. Send exactly one. |
 | `409` over and over | Another device is writing the same path. Read `error.server_entry`, resolve, retry with the new version. |
 | Client refuses the certificate | It is self-signed. Import the generated `tls.crt`, pass a real certificate with `-tls-cert`/`-tls-key`, or terminate TLS at a proxy. |

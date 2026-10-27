@@ -11,5 +11,7 @@
   "trusted_proxies": ["127.0.0.1/32", "::1/128"],
   "rate_limit_burst": 10,
   "rate_limit_refill_per_sec": 0.1,
-  "log_level": "info"
+  "log_level": "info",
+  "log_format": "text",
+  "registration": "admin"
 }

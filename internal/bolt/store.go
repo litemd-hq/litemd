@@ -1,10 +1,10 @@
-// Package bolt wraps the embedded bbolt database holding users, refresh
-// tokens, the per-file index and a global monotonic version counter.
+// Package bolt wraps the embedded bbolt database holding users, login sessions
+// (access and refresh tokens), personal API tokens, the per-file index and a
+// global monotonic version counter.
 package bolt
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -23,14 +23,20 @@ import (
 )
 
 var (
-	BucketUsers     = []byte("users")     // userUUID -> User (JSON)
-	BucketNames     = []byte("usernames") // username -> userUUID
-	BucketRefresh   = []byte("refresh")   // sha256(refresh) -> RefreshRecord (JSON)
-	BucketFiles     = []byte("files")     // userUUID\x00path -> files.Entry (JSON)
-	BucketTags      = []byte("tags")      // userUUID\x00tag\x00path -> {1}
-	BucketBacklinks = []byte("backlinks") // userUUID\x00targetKey\x00sourcePath -> {1}
-	BucketFolders   = []byte("folders")   // userUUID\x00path -> files.Folder (JSON)
-	BucketMeta      = []byte("meta")      // versions, jwt_secret
+	BucketUsers        = []byte("users")        // userUUID -> User (JSON)
+	BucketNames        = []byte("usernames")    // username -> userUUID
+	BucketRefresh      = []byte("refresh")      // sha256(refresh) -> RefreshRecord (JSON)
+	BucketAccess       = []byte("access")       // sha256(access) -> AccessRecord (JSON)
+	BucketSessions     = []byte("sessions")     // family -> SessionMeta (JSON)
+	BucketUserSessions = []byte("usersessions") // userUUID\x00family -> {1}
+	BucketRefreshFam   = []byte("refreshfam")   // family\x00sha256(refresh) -> {1}
+	BucketPATs         = []byte("pats")         // sha256(pat) -> PATRecord (JSON)
+	BucketPATIndex     = []byte("patindex")     // userUUID\x00patID -> sha256(pat)
+	BucketFiles        = []byte("files")        // userUUID\x00path -> files.Entry (JSON)
+	BucketTags         = []byte("tags")         // userUUID\x00tag\x00path -> {1}
+	BucketBacklinks    = []byte("backlinks")    // userUUID\x00targetKey\x00sourcePath -> {1}
+	BucketFolders      = []byte("folders")      // userUUID\x00path -> files.Folder (JSON)
+	BucketMeta         = []byte("meta")         // versions, auth schema version
 
 	fileKeySep = []byte{0}
 )
@@ -42,6 +48,13 @@ var (
 	// ErrMoveCollision reports that a folder move would overwrite a live file
 	// or folder at one of the destination paths.
 	ErrMoveCollision = errors.New("destination path already exists")
+	// ErrUsernameTaken reports that a username is already registered.
+	ErrUsernameTaken = errors.New("username already taken")
+	// ErrRegistrationClosed reports that self-registration was refused because
+	// the store already holds a user and no admin authorized the request.
+	ErrRegistrationClosed = errors.New("registration is closed")
+	// ErrLastAdmin reports an attempt to remove the only administrator.
+	ErrLastAdmin = errors.New("cannot remove the last administrator")
 )
 
 type Store struct {
@@ -57,12 +70,16 @@ func Open(dataDir string) (*Store, error) {
 		return nil, err
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{BucketUsers, BucketNames, BucketRefresh, BucketFiles, BucketTags, BucketBacklinks, BucketFolders, BucketMeta} {
+		for _, b := range [][]byte{
+			BucketUsers, BucketNames, BucketRefresh, BucketAccess, BucketSessions,
+			BucketUserSessions, BucketRefreshFam, BucketPATs, BucketPATIndex,
+			BucketFiles, BucketTags, BucketBacklinks, BucketFolders, BucketMeta,
+		} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
 		}
-		return nil
+		return backfillAuthTx(tx)
 	})
 	if err != nil {
 		db.Close()
@@ -93,24 +110,236 @@ func (s *Store) CountUsers() (int, error) {
 	return n, err
 }
 
-func (s *Store) CreateUser(u *User) error {
+// CreateUser stores a user. The first user ever written always becomes an
+// admin and is always allowed, which makes the bootstrap decision atomic: the
+// user count and the write happen in one transaction, so concurrent first
+// registrations cannot both slip through. Once the store holds a user, a
+// request is accepted only when admin authorized it or the open policy is on;
+// otherwise it fails with ErrRegistrationClosed.
+func (s *Store) CreateUser(u *User, adminAuthorized, open bool) error {
 	return s.DB.Update(func(tx *bolt.Tx) error {
+		users := tx.Bucket(BucketUsers)
 		names := tx.Bucket(BucketNames)
 		if names.Get([]byte(u.Username)) != nil {
-			return fmt.Errorf("username already taken")
+			return ErrUsernameTaken
 		}
-		if tx.Bucket(BucketUsers).Get([]byte(u.UUID)) != nil {
+		if users.Get([]byte(u.UUID)) != nil {
 			return fmt.Errorf("user uuid collision")
+		}
+		if n := users.Stats().KeyN; n == 0 {
+			u.IsAdmin = true
+		} else if !adminAuthorized && !open {
+			return ErrRegistrationClosed
 		}
 		raw, err := json.Marshal(u)
 		if err != nil {
 			return err
 		}
-		if err := tx.Bucket(BucketUsers).Put([]byte(u.UUID), raw); err != nil {
+		if err := users.Put([]byte(u.UUID), raw); err != nil {
 			return err
 		}
 		return names.Put([]byte(u.Username), []byte(u.UUID))
 	})
+}
+
+// ListUsers returns every user, ordered by creation time then username.
+func (s *Store) ListUsers() ([]User, error) {
+	var out []User
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(BucketUsers).Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var u User
+			if err := json.Unmarshal(v, &u); err != nil {
+				return err
+			}
+			out = append(out, u)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].Username < out[j].Username
+	})
+	return out, nil
+}
+
+// UpdateUser applies a partial update. A nil field is left unchanged. Quota 0
+// means unlimited. Demoting the last administrator fails with ErrLastAdmin.
+func (s *Store) UpdateUser(userUUID string, quota *int64, isAdmin *bool) (*User, error) {
+	var out User
+	err := s.DB.Update(func(tx *bolt.Tx) error {
+		users := tx.Bucket(BucketUsers)
+		raw := users.Get([]byte(userUUID))
+		if raw == nil {
+			return ErrNotFound
+		}
+		var u User
+		if err := json.Unmarshal(raw, &u); err != nil {
+			return err
+		}
+		if isAdmin != nil {
+			if u.IsAdmin && !*isAdmin && adminCountTx(tx) <= 1 {
+				return ErrLastAdmin
+			}
+			u.IsAdmin = *isAdmin
+		}
+		if quota != nil {
+			u.Quota = *quota
+		}
+		raw, err := json.Marshal(&u)
+		if err != nil {
+			return err
+		}
+		if err := users.Put([]byte(userUUID), raw); err != nil {
+			return err
+		}
+		out = u
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// UpdateUserUsername renames a user, keeping the username index consistent. The
+// request fails with ErrUsernameTaken when the new name is in use. Tokens are
+// keyed by UUID, so renaming does not invalidate any session.
+func (s *Store) UpdateUserUsername(userUUID, newUsername string) (*User, error) {
+	var out User
+	err := s.DB.Update(func(tx *bolt.Tx) error {
+		users := tx.Bucket(BucketUsers)
+		names := tx.Bucket(BucketNames)
+		raw := users.Get([]byte(userUUID))
+		if raw == nil {
+			return ErrNotFound
+		}
+		var u User
+		if err := json.Unmarshal(raw, &u); err != nil {
+			return err
+		}
+		if u.Username == newUsername {
+			out = u
+			return nil
+		}
+		if names.Get([]byte(newUsername)) != nil {
+			return ErrUsernameTaken
+		}
+		if err := names.Delete([]byte(u.Username)); err != nil {
+			return err
+		}
+		if err := names.Put([]byte(newUsername), []byte(userUUID)); err != nil {
+			return err
+		}
+		u.Username = newUsername
+		encoded, err := json.Marshal(&u)
+		if err != nil {
+			return err
+		}
+		if err := users.Put([]byte(userUUID), encoded); err != nil {
+			return err
+		}
+		out = u
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SetUserPassword replaces a user's password hash without touching sessions.
+func (s *Store) SetUserPassword(userUUID, argon2 string) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		users := tx.Bucket(BucketUsers)
+		raw := users.Get([]byte(userUUID))
+		if raw == nil {
+			return ErrNotFound
+		}
+		var u User
+		if err := json.Unmarshal(raw, &u); err != nil {
+			return err
+		}
+		u.Argon2 = argon2
+		raw, err := json.Marshal(&u)
+		if err != nil {
+			return err
+		}
+		return users.Put([]byte(userUUID), raw)
+	})
+}
+
+func adminCountTx(tx *bolt.Tx) int {
+	n := 0
+	c := tx.Bucket(BucketUsers).Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		var u User
+		if err := json.Unmarshal(v, &u); err != nil {
+			continue
+		}
+		if u.IsAdmin {
+			n++
+		}
+	}
+	return n
+}
+
+// DeleteUser removes a user and every record they own: credentials, sessions
+// and personal tokens, file and folder records, and the derived tag/backlink
+// indexes, all in one transaction. The on-disk files are removed by the caller.
+// Deleting the last administrator fails with ErrLastAdmin.
+func (s *Store) DeleteUser(userUUID string) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		users := tx.Bucket(BucketUsers)
+		raw := users.Get([]byte(userUUID))
+		if raw == nil {
+			return ErrNotFound
+		}
+		var u User
+		if err := json.Unmarshal(raw, &u); err != nil {
+			return err
+		}
+		if u.IsAdmin && adminCountTx(tx) <= 1 {
+			return ErrLastAdmin
+		}
+		if err := tx.Bucket(BucketNames).Delete([]byte(u.Username)); err != nil {
+			return err
+		}
+		if err := revokeAllFamiliesTx(tx, userUUID); err != nil {
+			return err
+		}
+		if err := deletePATsTx(tx, userUUID); err != nil {
+			return err
+		}
+		prefix := append([]byte(userUUID), fileKeySep...)
+		for _, b := range [][]byte{BucketFiles, BucketFolders, BucketTags, BucketBacklinks} {
+			if err := deletePrefixTx(tx, b, prefix); err != nil {
+				return err
+			}
+		}
+		return users.Delete([]byte(userUUID))
+	})
+}
+
+// deletePrefixTx removes every key in bucket beginning with prefix.
+func deletePrefixTx(tx *bolt.Tx, bucket, prefix []byte) error {
+	b := tx.Bucket(bucket)
+	var keys [][]byte
+	c := b.Cursor()
+	for k, _ := c.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, _ = c.Next() {
+		keys = append(keys, append([]byte(nil), k...))
+	}
+	for _, k := range keys {
+		if err := b.Delete(k); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) UserByUUID(uuid string) (*User, error) {
@@ -145,7 +374,13 @@ func (s *Store) user(get func(*bolt.Tx) []byte) (*User, error) {
 	return u, nil
 }
 
-// --- refresh tokens ---
+// --- sessions, access tokens and refresh tokens ---
+//
+// A login creates a "session" identified by a random family id. The session
+// owns short-lived access tokens (opaque, stored hashed) and a rotating refresh
+// token. An access token is honored only while its session row still exists, so
+// deleting the session revokes every access token of that session immediately,
+// with no expiry window.
 
 type RefreshRecord struct {
 	UserUUID string    `json:"user_uuid"`
@@ -156,21 +391,193 @@ type RefreshRecord struct {
 	Rotated bool `json:"rotated,omitempty"`
 }
 
+// AccessRecord is one issued access token, keyed by its hash.
+type AccessRecord struct {
+	UserUUID string    `json:"user_uuid"`
+	Family   string    `json:"family"`
+	Expires  time.Time `json:"expires"`
+}
+
+// SessionMeta is the canonical record for a login session ("family"). It is the
+// row a session listing shows and the row whose deletion revokes the session:
+// access tokens are only honored while their session row exists.
+type SessionMeta struct {
+	UserUUID  string    `json:"user_uuid"`
+	Family    string    `json:"family"`
+	CreatedAt time.Time `json:"created_at"`
+	LastSeen  time.Time `json:"last_seen"`
+	UserAgent string    `json:"user_agent,omitempty"`
+	IP        string    `json:"ip,omitempty"`
+}
+
+// PATRecord is a personal API token. It authenticates as its owner but is never
+// refreshed; it lives until revoked or until Expires (zero means no expiry).
+type PATRecord struct {
+	ID        string    `json:"id"`
+	UserUUID  string    `json:"user_uuid"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+	LastSeen  time.Time `json:"last_seen"`
+	Expires   time.Time `json:"expires,omitempty"`
+}
+
 func HashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Store) SaveRefresh(tokenHash string, rec *RefreshRecord) error {
+func sessionIndexKey(userUUID, family string) []byte {
+	return append(append([]byte(userUUID), fileKeySep...), []byte(family)...)
+}
+
+func refreshFamilyKey(family, tokenHash string) []byte {
+	return append(append([]byte(family), fileKeySep...), []byte(tokenHash)...)
+}
+
+func patIndexKey(userUUID, id string) []byte {
+	return append(append([]byte(userUUID), fileKeySep...), []byte(id)...)
+}
+
+func putRefreshTx(tx *bolt.Tx, tokenHash string, rec *RefreshRecord) error {
 	raw, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
+	if err := tx.Bucket(BucketRefresh).Put([]byte(tokenHash), raw); err != nil {
+		return err
+	}
+	return tx.Bucket(BucketRefreshFam).Put(refreshFamilyKey(rec.Family, tokenHash), indexMarker)
+}
+
+func deleteRefreshTx(tx *bolt.Tx, tokenHash string, rec *RefreshRecord) error {
+	if err := tx.Bucket(BucketRefresh).Delete([]byte(tokenHash)); err != nil {
+		return err
+	}
+	return tx.Bucket(BucketRefreshFam).Delete(refreshFamilyKey(rec.Family, tokenHash))
+}
+
+func putAccessTx(tx *bolt.Tx, tokenHash string, rec *AccessRecord) error {
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return tx.Bucket(BucketAccess).Put([]byte(tokenHash), raw)
+}
+
+func putSessionTx(tx *bolt.Tx, m *SessionMeta) error {
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if err := tx.Bucket(BucketSessions).Put([]byte(m.Family), raw); err != nil {
+		return err
+	}
+	return tx.Bucket(BucketUserSessions).Put(sessionIndexKey(m.UserUUID, m.Family), indexMarker)
+}
+
+func touchSessionTx(tx *bolt.Tx, family string, seen time.Time) error {
+	b := tx.Bucket(BucketSessions)
+	raw := b.Get([]byte(family))
+	if raw == nil {
+		return nil
+	}
+	var m SessionMeta
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return err
+	}
+	m.LastSeen = seen
+	raw, err := json.Marshal(&m)
+	if err != nil {
+		return err
+	}
+	return b.Put([]byte(family), raw)
+}
+
+// revokeFamilyTx deletes a session: the session row (which invalidates every
+// access token of the family) and every refresh token in the family. It returns
+// the number of refresh tokens removed.
+func revokeFamilyTx(tx *bolt.Tx, userUUID, family string) (int, error) {
+	if err := tx.Bucket(BucketSessions).Delete([]byte(family)); err != nil {
+		return 0, err
+	}
+	if userUUID != "" {
+		if err := tx.Bucket(BucketUserSessions).Delete(sessionIndexKey(userUUID, family)); err != nil {
+			return 0, err
+		}
+	}
+	famB := tx.Bucket(BucketRefreshFam)
+	refB := tx.Bucket(BucketRefresh)
+	prefix := append([]byte(family), fileKeySep...)
+	var hashes [][]byte
+	c := famB.Cursor()
+	for k, _ := c.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, _ = c.Next() {
+		hashes = append(hashes, append([]byte(nil), k[len(prefix):]...))
+	}
+	for _, h := range hashes {
+		if err := refB.Delete(h); err != nil {
+			return 0, err
+		}
+		if err := famB.Delete(refreshFamilyKey(family, string(h))); err != nil {
+			return 0, err
+		}
+	}
+	return len(hashes), nil
+}
+
+// revokeAllFamiliesTx revokes every session owned by userUUID.
+func revokeAllFamiliesTx(tx *bolt.Tx, userUUID string) error {
+	prefix := append([]byte(userUUID), fileKeySep...)
+	var families []string
+	c := tx.Bucket(BucketUserSessions).Cursor()
+	for k, _ := c.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, _ = c.Next() {
+		families = append(families, string(k[len(prefix):]))
+	}
+	for _, f := range families {
+		if _, err := revokeFamilyTx(tx, userUUID, f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PutTokens installs a fresh access/refresh pair in one transaction.
+func (s *Store) PutTokens(accessHash string, access *AccessRecord, refreshHash string, refresh *RefreshRecord) error {
 	return s.DB.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(BucketRefresh).Put([]byte(tokenHash), raw)
+		if err := putAccessTx(tx, accessHash, access); err != nil {
+			return err
+		}
+		return putRefreshTx(tx, refreshHash, refresh)
 	})
 }
 
+// RotateRefresh atomically consumes oldHash and installs the successor refresh
+// and access tokens, so a crash cannot leave a consumed token without a
+// replacement. The consumed token is kept (marked rotated) for theft detection
+// until it expires.
+func (s *Store) RotateRefresh(oldHash string, old *RefreshRecord, newHash string, next *RefreshRecord, accessHash string, access *AccessRecord, seen time.Time) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		old.Rotated = true
+		if err := putRefreshTx(tx, oldHash, old); err != nil {
+			return err
+		}
+		if err := putRefreshTx(tx, newHash, next); err != nil {
+			return err
+		}
+		if err := putAccessTx(tx, accessHash, access); err != nil {
+			return err
+		}
+		return touchSessionTx(tx, next.Family, seen)
+	})
+}
+
+// SaveRefresh stores a refresh token by hash.
+func (s *Store) SaveRefresh(tokenHash string, rec *RefreshRecord) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		return putRefreshTx(tx, tokenHash, rec)
+	})
+}
+
+// GetRefresh looks up a refresh token by hash.
 func (s *Store) GetRefresh(tokenHash string) (*RefreshRecord, error) {
 	var rec *RefreshRecord
 	err := s.DB.View(func(tx *bolt.Tx) error {
@@ -187,56 +594,402 @@ func (s *Store) GetRefresh(tokenHash string) (*RefreshRecord, error) {
 	return rec, nil
 }
 
+// DeleteRefresh removes a refresh token and its family index entry.
 func (s *Store) DeleteRefresh(tokenHash string) error {
 	return s.DB.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(BucketRefresh).Delete([]byte(tokenHash))
+		raw := tx.Bucket(BucketRefresh).Get([]byte(tokenHash))
+		if raw == nil {
+			return nil
+		}
+		var rec RefreshRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			return err
+		}
+		return deleteRefreshTx(tx, tokenHash, &rec)
 	})
 }
 
-// RevokeFamily deletes every refresh token belonging to family. Called when
-// a rotated (already-used) refresh token is presented again: a strong signal
-// of token theft.
+// SaveAccess stores a short-lived access token by hash.
+func (s *Store) SaveAccess(tokenHash string, rec *AccessRecord) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		return putAccessTx(tx, tokenHash, rec)
+	})
+}
+
+// GetAccess looks up an access token by hash.
+func (s *Store) GetAccess(tokenHash string) (*AccessRecord, error) {
+	var rec *AccessRecord
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(BucketAccess).Get([]byte(tokenHash))
+		if raw == nil {
+			return ErrNotFound
+		}
+		rec = &AccessRecord{}
+		return json.Unmarshal(raw, rec)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
+// PutSession stores a session row and its per-user index entry.
+func (s *Store) PutSession(m *SessionMeta) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		return putSessionTx(tx, m)
+	})
+}
+
+// GetSession returns the session row for family, or ErrNotFound when the
+// session was revoked (which invalidates its access tokens).
+func (s *Store) GetSession(family string) (*SessionMeta, error) {
+	var m *SessionMeta
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(BucketSessions).Get([]byte(family))
+		if raw == nil {
+			return ErrNotFound
+		}
+		m = &SessionMeta{}
+		return json.Unmarshal(raw, m)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// SessionsByUser lists the live sessions of a user, most recently seen first.
+func (s *Store) SessionsByUser(userUUID string) ([]SessionMeta, error) {
+	var out []SessionMeta
+	prefix := append([]byte(userUUID), fileKeySep...)
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		ses := tx.Bucket(BucketSessions)
+		c := tx.Bucket(BucketUserSessions).Cursor()
+		for k, _ := c.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, _ = c.Next() {
+			raw := ses.Get([]byte(k[len(prefix):]))
+			if raw == nil {
+				continue
+			}
+			var m SessionMeta
+			if err := json.Unmarshal(raw, &m); err != nil {
+				return err
+			}
+			out = append(out, m)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].LastSeen.After(out[j].LastSeen) })
+	return out, nil
+}
+
+// RevokeSession deletes one session (and its refresh tokens), revoking its
+// access tokens immediately. It reports the number of refresh tokens removed.
+func (s *Store) RevokeSession(userUUID, family string) (int, error) {
+	revoked := 0
+	err := s.DB.Update(func(tx *bolt.Tx) error {
+		n, err := revokeFamilyTx(tx, userUUID, family)
+		revoked = n
+		return err
+	})
+	return revoked, err
+}
+
+// RevokeFamily revokes every token of family. Called when a rotated (already
+// used) refresh token is presented again: a strong signal of token theft.
 func (s *Store) RevokeFamily(family string) (int, error) {
 	revoked := 0
 	err := s.DB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(BucketRefresh)
-		c := b.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var rec RefreshRecord
-			if err := json.Unmarshal(v, &rec); err != nil || rec.Family != family {
-				continue
+		userUUID := ""
+		if raw := tx.Bucket(BucketSessions).Get([]byte(family)); raw != nil {
+			var m SessionMeta
+			if err := json.Unmarshal(raw, &m); err == nil {
+				userUUID = m.UserUUID
 			}
-			if err := b.Delete(k); err != nil {
+		}
+		n, err := revokeFamilyTx(tx, userUUID, family)
+		revoked = n
+		return err
+	})
+	return revoked, err
+}
+
+// RevokeAllForUser revokes every session owned by userUUID, signing the user out
+// on all devices. Access tokens die with their session, so there is no expiry
+// window. Returns the number of refresh tokens removed.
+func (s *Store) RevokeAllForUser(userUUID string) (int, error) {
+	revoked := 0
+	err := s.DB.Update(func(tx *bolt.Tx) error {
+		prefix := append([]byte(userUUID), fileKeySep...)
+		var families []string
+		c := tx.Bucket(BucketUserSessions).Cursor()
+		for k, _ := c.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, _ = c.Next() {
+			families = append(families, string(k[len(prefix):]))
+		}
+		for _, f := range families {
+			n, err := revokeFamilyTx(tx, userUUID, f)
+			if err != nil {
 				return err
 			}
-			revoked++
+			revoked += n
 		}
 		return nil
 	})
 	return revoked, err
 }
 
-// RevokeAllForUser deletes every refresh token owned by userUUID, i.e. signs
-// the user out on all devices. Access tokens already issued stay valid until
-// they expire, so keep access-ttl short.
-func (s *Store) RevokeAllForUser(userUUID string) (int, error) {
-	revoked := 0
-	err := s.DB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(BucketRefresh)
-		c := b.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var rec RefreshRecord
-			if err := json.Unmarshal(v, &rec); err != nil || rec.UserUUID != userUUID {
+// --- personal API tokens ---
+
+// SavePAT stores a personal API token by hash and indexes it for its owner.
+func (s *Store) SavePAT(tokenHash string, rec *PATRecord) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		raw, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket(BucketPATs).Put([]byte(tokenHash), raw); err != nil {
+			return err
+		}
+		return tx.Bucket(BucketPATIndex).Put(patIndexKey(rec.UserUUID, rec.ID), []byte(tokenHash))
+	})
+}
+
+// GetPAT looks up a personal API token by hash.
+func (s *Store) GetPAT(tokenHash string) (*PATRecord, error) {
+	var rec *PATRecord
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(BucketPATs).Get([]byte(tokenHash))
+		if raw == nil {
+			return ErrNotFound
+		}
+		rec = &PATRecord{}
+		return json.Unmarshal(raw, rec)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
+// PATsByUser lists a user's personal tokens, newest first.
+func (s *Store) PATsByUser(userUUID string) ([]PATRecord, error) {
+	var out []PATRecord
+	prefix := append([]byte(userUUID), fileKeySep...)
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		pats := tx.Bucket(BucketPATs)
+		c := tx.Bucket(BucketPATIndex).Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, v = c.Next() {
+			raw := pats.Get(v)
+			if raw == nil {
 				continue
 			}
-			if err := b.Delete(k); err != nil {
+			var rec PATRecord
+			if err := json.Unmarshal(raw, &rec); err != nil {
 				return err
 			}
-			revoked++
+			out = append(out, rec)
 		}
 		return nil
 	})
-	return revoked, err
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// DeletePAT revokes the user's personal token with the given id.
+func (s *Store) DeletePAT(userUUID, id string) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		idx := tx.Bucket(BucketPATIndex)
+		key := patIndexKey(userUUID, id)
+		hash := idx.Get(key)
+		if hash == nil {
+			return ErrNotFound
+		}
+		if err := tx.Bucket(BucketPATs).Delete(hash); err != nil {
+			return err
+		}
+		return idx.Delete(key)
+	})
+}
+
+func deletePATsTx(tx *bolt.Tx, userUUID string) error {
+	prefix := append([]byte(userUUID), fileKeySep...)
+	idx := tx.Bucket(BucketPATIndex)
+	var keys, hashes [][]byte
+	c := idx.Cursor()
+	for k, v := c.Seek(prefix); k != nil && bytesHasPrefix(k, prefix); k, v = c.Next() {
+		keys = append(keys, append([]byte(nil), k...))
+		hashes = append(hashes, append([]byte(nil), v...))
+	}
+	for i := range keys {
+		if err := tx.Bucket(BucketPATs).Delete(hashes[i]); err != nil {
+			return err
+		}
+		if err := idx.Delete(keys[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- housekeeping ---
+
+// PurgeExpired removes expired access tokens, expired refresh tokens, personal
+// tokens past their expiry, and session rows with no live refresh token. It is
+// safe to run while the server is up (a single write transaction).
+func (s *Store) PurgeExpired(now time.Time, refreshTTL time.Duration) (int, error) {
+	purged := 0
+	err := s.DB.Update(func(tx *bolt.Tx) error {
+		purged = 0
+		type refreshDead struct {
+			hash string
+			rec  RefreshRecord
+		}
+		refB := tx.Bucket(BucketRefresh)
+		famB := tx.Bucket(BucketRefreshFam)
+		var deadRefresh []refreshDead
+		c := refB.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var rec RefreshRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				continue
+			}
+			if rec.Expires.Before(now) {
+				deadRefresh = append(deadRefresh, refreshDead{string(k), rec})
+			}
+		}
+		for _, d := range deadRefresh {
+			if err := refB.Delete([]byte(d.hash)); err != nil {
+				return err
+			}
+			if err := famB.Delete(refreshFamilyKey(d.rec.Family, d.hash)); err != nil {
+				return err
+			}
+			purged++
+		}
+
+		accB := tx.Bucket(BucketAccess)
+		var deadAccess [][]byte
+		ac := accB.Cursor()
+		for k, v := ac.First(); k != nil; k, v = ac.Next() {
+			var rec AccessRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				continue
+			}
+			if rec.Expires.Before(now) {
+				deadAccess = append(deadAccess, append([]byte(nil), k...))
+			}
+		}
+		for _, k := range deadAccess {
+			if err := accB.Delete(k); err != nil {
+				return err
+			}
+			purged++
+		}
+
+		sesB := tx.Bucket(BucketSessions)
+		usB := tx.Bucket(BucketUserSessions)
+		var deadSessions []SessionMeta
+		sc := sesB.Cursor()
+		for k, v := sc.First(); k != nil; k, v = sc.Next() {
+			var m SessionMeta
+			if err := json.Unmarshal(v, &m); err != nil {
+				continue
+			}
+			if m.LastSeen.Add(refreshTTL).Before(now) {
+				deadSessions = append(deadSessions, m)
+			}
+		}
+		for _, m := range deadSessions {
+			if err := sesB.Delete([]byte(m.Family)); err != nil {
+				return err
+			}
+			if err := usB.Delete(sessionIndexKey(m.UserUUID, m.Family)); err != nil {
+				return err
+			}
+			purged++
+		}
+
+		type patDead struct {
+			hash string
+			rec  PATRecord
+		}
+		patB := tx.Bucket(BucketPATs)
+		piB := tx.Bucket(BucketPATIndex)
+		var deadPATs []patDead
+		pc := patB.Cursor()
+		for k, v := pc.First(); k != nil; k, v = pc.Next() {
+			var rec PATRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				continue
+			}
+			if !rec.Expires.IsZero() && rec.Expires.Before(now) {
+				deadPATs = append(deadPATs, patDead{string(k), rec})
+			}
+		}
+		for _, d := range deadPATs {
+			if err := patB.Delete([]byte(d.hash)); err != nil {
+				return err
+			}
+			if err := piB.Delete(patIndexKey(d.rec.UserUUID, d.rec.ID)); err != nil {
+				return err
+			}
+			purged++
+		}
+		return nil
+	})
+	return purged, err
+}
+
+// backfillAuthTx upgrades a database written before sessions and access tokens
+// existed by building the family and session indexes from the refresh records.
+// It is idempotent: it runs once, guarded by a schema marker in the meta bucket.
+func backfillAuthTx(tx *bolt.Tx) error {
+	meta := tx.Bucket(BucketMeta)
+	if meta.Get([]byte("authver")) != nil {
+		return nil
+	}
+	type refreshRow struct {
+		hash string
+		rec  RefreshRecord
+	}
+	refB := tx.Bucket(BucketRefresh)
+	famB := tx.Bucket(BucketRefreshFam)
+	sesB := tx.Bucket(BucketSessions)
+	usB := tx.Bucket(BucketUserSessions)
+	var rows []refreshRow
+	c := refB.Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		var rec RefreshRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			continue
+		}
+		rows = append(rows, refreshRow{string(k), rec})
+	}
+	now := time.Now().UTC()
+	for _, e := range rows {
+		if err := famB.Put(refreshFamilyKey(e.rec.Family, e.hash), indexMarker); err != nil {
+			return err
+		}
+		if sesB.Get([]byte(e.rec.Family)) == nil {
+			m := SessionMeta{UserUUID: e.rec.UserUUID, Family: e.rec.Family, CreatedAt: now, LastSeen: now}
+			raw, err := json.Marshal(&m)
+			if err != nil {
+				return err
+			}
+			if err := sesB.Put([]byte(m.Family), raw); err != nil {
+				return err
+			}
+		}
+		if err := usB.Put(sessionIndexKey(e.rec.UserUUID, e.rec.Family), indexMarker); err != nil {
+			return err
+		}
+	}
+	return meta.Put([]byte("authver"), []byte{1})
 }
 
 // --- file index ---
@@ -1093,24 +1846,4 @@ func (s *Store) DeleteFolderTree(userRoot, userUUID, from string) ([]files.Entry
 		_ = os.RemoveAll(dir)
 	}
 	return deadFiles, deadFolders, nil
-}
-
-// --- secrets ---
-
-// JWTSecret returns the persistent HMAC secret, creating one on first use.
-func (s *Store) JWTSecret() ([]byte, error) {
-	var secret []byte
-	err := s.DB.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(BucketMeta)
-		if raw := b.Get([]byte("jwt_secret")); raw != nil {
-			secret = append([]byte(nil), raw...)
-			return nil
-		}
-		secret = make([]byte, 32)
-		if _, err := rand.Read(secret); err != nil {
-			return err
-		}
-		return b.Put([]byte("jwt_secret"), secret)
-	})
-	return secret, err
 }

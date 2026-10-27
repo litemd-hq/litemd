@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/netip"
@@ -14,7 +15,10 @@ import (
 
 type ctxKey int
 
-const userKey ctxKey = iota
+const (
+	userKey ctxKey = iota
+	sessionKey
+)
 
 // userFromRequest returns the authenticated user set by requireAuth.
 func userFromRequest(r *http.Request) *bolt.User {
@@ -22,49 +26,63 @@ func userFromRequest(r *http.Request) *bolt.User {
 	return u
 }
 
+// sessionFamilyFromRequest returns the session family of the bearer token, or
+// "" when the request used a personal API token or was unauthenticated.
+func sessionFamilyFromRequest(r *http.Request) string {
+	f, _ := r.Context().Value(sessionKey).(string)
+	return f
+}
+
+var errNoToken = errors.New("missing bearer token")
+
+// authenticate resolves the request's bearer token, which may be a session
+// access token or a personal API token.
+func (s *Server) authenticate(r *http.Request) (*bolt.User, string, error) {
+	h := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(h, prefix) {
+		return nil, "", errNoToken
+	}
+	return s.auth.Authenticate(strings.TrimPrefix(h, prefix))
+}
+
+// requireAuth guards a route behind any authenticated user.
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		h := r.Header.Get("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(h, prefix) {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "missing bearer token")
-			return
-		}
-		uuid, err := s.auth.ParseAccess(strings.TrimPrefix(h, prefix))
+		user, family, err := s.authenticate(r)
 		if err != nil {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired access token")
+			if errors.Is(err, errNoToken) {
+				writeError(w, http.StatusUnauthorized, "unauthorized", "missing bearer token")
+				return
+			}
+			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired token")
 			return
 		}
-		user, err := s.store.UserByUUID(uuid)
-		if err != nil {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired access token")
-			return
-		}
-		next(w, r.WithContext(context.WithValue(r.Context(), userKey, user)))
+		ctx := context.WithValue(r.Context(), userKey, user)
+		ctx = context.WithValue(ctx, sessionKey, family)
+		next(w, r.WithContext(ctx))
 	}
 }
 
-// requireAdmin wraps an unauthenticated route that may optionally carry an
-// admin token (used by POST /auth/register once the first user exists).
+// requireAdmin guards a route behind an authenticated administrator.
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		h := r.Header.Get("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(h, prefix) {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "registration requires an admin token")
-			return
-		}
-		uuid, err := s.auth.ParseAccess(strings.TrimPrefix(h, prefix))
+		user, family, err := s.authenticate(r)
 		if err != nil {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired access token")
+			if errors.Is(err, errNoToken) {
+				writeError(w, http.StatusUnauthorized, "unauthorized", "missing bearer token")
+				return
+			}
+			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired token")
 			return
 		}
-		user, err := s.store.UserByUUID(uuid)
-		if err != nil || !user.IsAdmin {
+		if !user.IsAdmin {
 			writeError(w, http.StatusForbidden, "forbidden", "admin privileges required")
 			return
 		}
-		next(w, r.WithContext(context.WithValue(r.Context(), userKey, user)))
+		ctx := context.WithValue(r.Context(), userKey, user)
+		ctx = context.WithValue(ctx, sessionKey, family)
+		next(w, r.WithContext(ctx))
 	}
 }
 

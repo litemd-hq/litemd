@@ -79,6 +79,25 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
 	mux.HandleFunc("POST /api/v1/auth/revoke-all", s.requireAuth(s.handleRevokeAll))
 
+	// Account self-service: profile, password, sessions and personal tokens.
+	mux.HandleFunc("GET /api/v1/auth/me", s.requireAuth(s.handleMe))
+	mux.HandleFunc("POST /api/v1/auth/password", s.requireAuth(s.rateLimit(s.handleChangePassword)))
+	mux.HandleFunc("POST /api/v1/auth/username", s.requireAuth(s.rateLimit(s.handleChangeUsername)))
+	mux.HandleFunc("GET /api/v1/auth/sessions", s.requireAuth(s.handleSessions))
+	mux.HandleFunc("DELETE /api/v1/auth/sessions/{id}", s.requireAuth(s.handleRevokeSession))
+	mux.HandleFunc("GET /api/v1/auth/tokens", s.requireAuth(s.handleListPATs))
+	mux.HandleFunc("POST /api/v1/auth/tokens", s.requireAuth(s.rateLimit(s.handleCreatePAT)))
+	mux.HandleFunc("DELETE /api/v1/auth/tokens/{id}", s.requireAuth(s.handleRevokePAT))
+
+	// Admin user management.
+	mux.HandleFunc("GET /api/v1/users", s.requireAdmin(s.handleListUsers))
+	mux.HandleFunc("POST /api/v1/users", s.requireAdmin(s.handleCreateUser))
+	mux.HandleFunc("GET /api/v1/users/{uuid}", s.requireAdmin(s.handleGetUser))
+	mux.HandleFunc("PATCH /api/v1/users/{uuid}", s.requireAdmin(s.handleUpdateUser))
+	mux.HandleFunc("DELETE /api/v1/users/{uuid}", s.requireAdmin(s.handleDeleteUser))
+	mux.HandleFunc("POST /api/v1/users/{uuid}/password", s.requireAdmin(s.handleAdminResetPassword))
+	mux.HandleFunc("POST /api/v1/users/{uuid}/revoke", s.requireAdmin(s.handleAdminRevokeUser))
+
 	mux.HandleFunc("GET /api/v1/files", s.requireAuth(s.handleManifest))
 	mux.HandleFunc("GET /api/v1/files/{path...}", s.requireAuth(s.handleDownload))
 	mux.HandleFunc("PUT /api/v1/files/{path...}", s.requireAuth(s.handleUpload))

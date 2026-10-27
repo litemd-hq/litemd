@@ -49,7 +49,7 @@ CLIENT_GUIDE.md
 # Local runtime state. The default data directory (-data ./data) and the
 # wizard's default output (litemd init -> ./config.json) both land in the repo
 # root if you run the server from here. NEVER commit the data directory: it
-# holds the JWT secret, password hashes and your whole vault.
+# holds password hashes, session tokens and your whole vault.
 /data/
 /config.json
 
